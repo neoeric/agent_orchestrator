@@ -23,6 +23,31 @@ base_branch、branch、worktree、spec_file、prebuild、verify[]、review.instr
 第一次真跑（目標 repo 的 `index_sync` 既有紅燈，一行修法）：一輪收斂，Codex 186s（input 284K，其中 cached 264K）、三組驗證 274s、
 agy 59s（input 12K＋cache 16K，output 4K），commit `0000000` 於 `fix/index-sync`；diff 正是最小改動。
 
+### 在 VS Code 看三個角色協力（即時串流）
+
+relay 把 Codex、agy、驗證、判定的進度邊跑邊印，帶顏色前綴，直接在你自己開的 VS Code 整合終端機看得到：
+
+```text
+[CODEX]  青色 · 實作者：它在讀哪個檔、跑什麼指令、改了什麼、講了什麼
+[AGY]    紫色 · 審查者：逐條核對與總判定
+[VERIFY] 綠色 · 驗證指令的 PASS／FAIL
+[JUDGE]  黃色 · 送審或跳過的判準
+[RELAY]  灰色 · 編排器自己的階段
+```
+
+怎麼看：在 VS Code 的整合終端機（不是 Claude 面板）自己跑
+
+```text
+set PYTHONUTF8=1
+python relay.py tasks/demo-add-mul.json
+```
+
+就會看到三個角色的行交錯滾動。想關顏色設 `NO_COLOR=1`。Codex 與 agy 是背景子行程（走 CLI，不走它們的 VS Code 擴充），
+所以它們的擴充面板不會亮；「看得到它們協力」的地方就是這個終端機，加上左邊檔案總管的 `runs/<任務>/` 與 Source Control 的分支 commit。
+
+⚠️ demo 揭露的一個真相：Codex 在自己的無頭環境裡 `python`／`py`／`rg` 都跑不動（WindowsApps stub），它自己驗不了測試，
+但改動是對的、relay 用完整路徑 python 一跑就過。這正是設計要點——**工人說「做好了」不算，relay 自己跑測試才算**。
+
 ### P2 難易度判準＋簽章閘門＋結構化審查、P4 用量帳本（2026-09-07 晚，三個真任務驗過）
 
 - **判準**（`review.policy`）：`always`（預設）／`never`／`auto`。`auto` 依序看客觀訊號，不用 Agent 自填的風險等級：

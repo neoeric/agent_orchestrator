@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -167,6 +168,94 @@ def sh(cmd: list[str], cwd: str | None = None, timeout: int = 900, env: dict | N
                           timeout=timeout, env=e, stdin=subprocess.DEVNULL)
 
 
+# ---- 即時串流：讓 VS Code 整合終端機看得到三個角色在協力 --------------------------------
+_ESC = chr(27)
+_COLORS = {"RELAY": "90", "CODEX": "36", "AGY": "35", "JUDGE": "33", "VERIFY": "32", "HUMAN": "93"}
+_USE_COLOR = os.environ.get("NO_COLOR") is None
+
+
+def emit(prefix: str, msg: str, logf=None) -> None:
+    tag = f"[{prefix}]"
+    shown = f"{_ESC}[{_COLORS.get(prefix, '0')}m{tag}{_ESC}[0m {msg}" if _USE_COLOR else f"{tag} {msg}"
+    print(shown, flush=True)
+    if logf:
+        with open(logf, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {tag} {msg}\n")
+
+
+def stream(cmd, prefix: str, on_line, cwd=None, timeout=900, env=None, logf=None, shell=False):
+    """跑子行程並逐行即時印帶前綴的行（給 VS Code 終端機看），同時完整收集 stdout／stderr 回傳給判定器。
+    on_line(rawline)->str|None：回字串就印（已翻成人看得懂），回 None 就吞掉（雜訊）。"""
+    e = dict(os.environ, PYTHONUTF8="1", GIT_TERMINAL_PROMPT="0")
+    if env:
+        e.update(env)
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace", env=e, stdin=subprocess.DEVNULL, bufsize=1, shell=shell)
+    out, err = [], []
+    et = threading.Thread(target=lambda: [err.append(x) for x in iter(p.stderr.readline, "")], daemon=True)
+    et.start()
+    killed = {"v": False}
+    timer = threading.Timer(timeout, lambda: (killed.__setitem__("v", True), p.kill()))
+    timer.start()
+    try:
+        for line in iter(p.stdout.readline, ""):
+            out.append(line)
+            m = on_line(line.rstrip("\r\n")) if on_line else line.rstrip("\r\n")
+            if m:
+                emit(prefix, m, logf)
+    finally:
+        timer.cancel()
+    p.wait()
+    et.join(timeout=5)
+    r = subprocess.CompletedProcess(cmd, p.returncode if not killed["v"] else 124, "".join(out), "".join(err))
+    return r
+
+
+def _codex_line(line: str):
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        e = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    t = e.get("type")
+    if t == "item.completed":
+        it = e.get("item") or {}
+        k = it.get("type")
+        if k == "agent_message":
+            tx = (it.get("text") or "").strip().replace("\n", " ")
+            return "💬 " + tx[:100] if tx else None
+        if k == "command_execution":
+            return f"$ [{it.get('status')}] " + (it.get("command") or "").strip().replace("\n", " ")[:88]
+        if k == "file_change":
+            ch = it.get("changes")
+            paths = [c.get("path", "") for c in ch] if isinstance(ch, list) else []
+            return "✏ 改檔 " + (", ".join(os.path.basename(x) for x in paths) if paths else str(ch)[:60])
+        if k == "error":
+            return "⚠ " + str(it.get("message", ""))[:88]
+    if t == "turn.completed":
+        u = e.get("usage") or {}
+        return f"✓ 完成一輪 in={u.get('input_tokens')} out={u.get('output_tokens')}"
+    if t == "turn.failed":
+        return "✗ turn.failed"
+    return None
+
+
+def _agy_line(line: str):
+    s = line.rstrip()
+    if not s.strip() or set(s.strip()) <= set("=-"):
+        return None
+    return s[:200]
+
+
+def _verify_line(line: str):
+    s = line.rstrip()
+    if s.strip() and re.search(r"PASS|FAIL|Ran \d+ test|^OK$|Error|Traceback|assert|exit=|差異|零差異|通過", s):
+        return s[:160]
+    return None
+
+
 def git(repo: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     return sh(["git", "-C", repo, *args], timeout=timeout)
 
@@ -199,11 +288,8 @@ class Run:
             # P4 只偵測不換手：真正的 429 至今未直接觀察到，先讓它大聲停下來
             raise RuntimeError(f"撞牆：{rec.cli} 回 rate_limit（{rec.reason}）。本版不自動換手，請人決定換誰。")
 
-    def log(self, msg: str) -> None:
-        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-        print(line, flush=True)
-        with open(self.dir / "relay.log", "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    def log(self, msg: str, prefix: str = "RELAY") -> None:
+        emit(prefix, msg, self.dir / "relay.log")
 
     # ---- 1. worktree ---------------------------------------------------------
     def prepare(self) -> None:
@@ -247,8 +333,8 @@ class Run:
             return True, "(dry)", None
         self.log(f"實作者 Codex 開跑（round {rnd}）…")
         t0 = time.monotonic()
-        cp = sh([CODEX, "exec", "--json", "-s", "workspace-write", "-C", self.wt, "-o", str(out_last), prompt],
-                cwd=self.wt, timeout=self.t.get("impl_timeout", 1500))
+        cp = stream([CODEX, "exec", "--json", "-s", "workspace-write", "-C", self.wt, "-o", str(out_last), prompt],
+                    "CODEX", _codex_line, cwd=self.wt, timeout=self.t.get("impl_timeout", 1500), logf=self.dir / "relay.log")
         so.write_text(cp.stdout, encoding="utf-8"); se.write_text(cp.stderr, encoding="utf-8"); ex.write_text(f"exit={cp.returncode}", encoding="utf-8")
         v = judge.judge("codex", cp.stdout, cp.stderr, cp.returncode)
         rec = CallRecord("implementer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(so),
@@ -269,9 +355,8 @@ class Run:
             self.log(f"驗證 {name}: {cmd}")
             cmd_py = cmd.replace("python ", f'"{PY}" ', 1) if cmd.startswith("python ") else cmd
             t0 = time.monotonic()
-            cp = subprocess.run(cmd_py, cwd=self.wt, shell=True, capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", env=dict(os.environ, PYTHONUTF8="1", **item.get("env", {})),
-                                timeout=item.get("timeout", 1800))
+            cp = stream(cmd_py, "VERIFY", _verify_line, cwd=self.wt, shell=True,
+                        env=item.get("env", {}), timeout=item.get("timeout", 1800), logf=self.dir / "relay.log")
             tail = "\n".join((cp.stdout + "\n" + cp.stderr).strip().splitlines()[-6:])
             ok = cp.returncode == 0
             all_ok &= ok
@@ -299,8 +384,9 @@ class Run:
             return True, "(dry)", None
         self.log(f"審查者 agy 開跑（round {rnd}，diff {len(diff.encode('utf-8'))} bytes）…")
         t0 = time.monotonic()
-        cp = sh([PY, str(AGY_REVIEW), "--instructions", str(instr_f), "--diff", str(diff_f), "--out", str(out_f)],
-                cwd=str(HERE), timeout=self.t.get("review_timeout", 1500), env={"AGY_EXE": AGY})
+        cp = stream([PY, str(AGY_REVIEW), "--instructions", str(instr_f), "--diff", str(diff_f), "--out", str(out_f)],
+                    "AGY", _agy_line, cwd=str(HERE), timeout=self.t.get("review_timeout", 1500),
+                    env={"AGY_EXE": AGY}, logf=self.dir / "relay.log")
         (self.dir / f"review_r{rnd}_tool.log").write_text(cp.stdout + "\n--- stderr ---\n" + cp.stderr, encoding="utf-8")
         obj = json.loads(out_f.read_text(encoding="utf-8")) if out_f.exists() and out_f.stat().st_size else None
         v = judge.judge("agy", json.dumps(obj) if obj else "", cp.stderr, cp.returncode)
@@ -427,7 +513,7 @@ class Run:
             self.state.review_decisions.append({"round": rnd, "need_review": need_review, "why": why,
                                                 "changed": changed_now, "breaking": sum(len(g["breaking"]) for g in gate.values())})
             self.save()
-            self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}")
+            self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}", prefix="JUDGE")
             if need_review:
                 r_ok, review_text, _ = self.review(rnd, diff)
             else:
