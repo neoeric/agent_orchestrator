@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+runs/*/impl_r*.stdout.txt
+runs/*/*.stderr.txt
+runs/*/review_r*_agy.json

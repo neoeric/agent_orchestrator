@@ -1,0 +1,8 @@
+{
+  "session_id": "222f8e19-dc34-4914-9b96-7f310e6e7cb0",
+  "error": {
+    "type": "Error",
+    "message": "Please set an Auth method in your C:\\Users\\<user>\\.gemini\\settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA",
+    "code": 41
+  }
+}

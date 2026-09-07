@@ -1,0 +1,23 @@
+Warning: True color (24-bit) support not detected. Using a terminal with true color enabled will result in a better visual experience.
+Ripgrep is not available. Falling back to GrepTool.
+Error when talking to Gemini API Full report available at: C:\Users\<user>\AppData\Local\Temp\gemini-client-error-Turn.run-sendMessageStream-2026-09-07T02-24-15-686Z.json _ApiError: {"error":{"message":"{\n  \"error\": {\n    \"code\": 400,\n    \"message\": \"API key not valid. Please pass a valid API key.\",\n    \"status\": \"INVALID_ARGUMENT\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\",\n        \"reason\": \"API_KEY_INVALID\",\n        \"domain\": \"googleapis.com\",\n        \"metadata\": {\n          \"service\": \"generativelanguage.googleapis.com\"\n        }\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.LocalizedMessage\",\n        \"locale\": \"en-US\",\n        \"message\": \"API key not valid. Please pass a valid API key.\"\n      }\n    ]\n  }\n}\n","code":400,"status":"Bad Request"}}
+    at throwErrorIfNotOK (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:267315:24)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:267078:7
+    at async Models.generateContentStream (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:268174:16)
+    at async file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:310543:19
+    at async file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:287352:23
+    at async retryWithBackoff (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:307380:23)
+    at async GeminiChat.makeApiCallAndProcessStream (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:331230:28)
+    at async GeminiChat.streamWithRetries (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:330983:29)
+    at async Turn.run (file:///C:/Users/<user>/AppData/Roaming/npm/node_modules/@google/gemini-cli/bundle/chunk-MFLFXOVQ.js:331905:24) {
+  status: 400
+}
+{
+  "session_id": "89ece341-472f-4815-bd0d-736292d79b07",
+  "error": {
+    "type": "Error",
+    "message": "{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 400,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"INVALID_ARGUMENT\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"API_KEY_INVALID\\\",\\n        \\\"domain\\\": \\\"googleapis.com\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\"\\n        }\\n      },\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.LocalizedMessage\\\",\\n        \\\"locale\\\": \\\"en-US\\\",\\n        \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\"\\n      }\\n    ]\\n  }\\n}\\n\",\"code\":400,\"status\":\"Bad Request\"}}",
+    "code": 400
+  }
+}
