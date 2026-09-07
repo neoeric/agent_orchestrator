@@ -23,8 +23,22 @@ base_branch、branch、worktree、spec_file、prebuild、verify[]、review.instr
 第一次真跑（目標 repo 的 `index_sync` 既有紅燈，一行修法）：一輪收斂，Codex 186s（input 284K，其中 cached 264K）、三組驗證 274s、
 agy 59s（input 12K＋cache 16K，output 4K），commit `0000000` 於 `fix/index-sync`；diff 正是最小改動。
 
-**已知限制（P1 刻意不做）**：實作者固定 Codex、審查者固定 agy（沒有換手）；沒有難易度判準（每棒都審）；沒有並行；
-usage 只記進 HANDOFF 不做撞牆換手；驗證指令由任務檔寫死（含 repo 級前置步驟）。
+### P2 難易度判準＋簽章閘門＋結構化審查、P4 用量帳本（2026-09-07 晚，三個真任務驗過）
+
+- **判準**（`review.policy`）：`always`（預設）／`never`／`auto`。`auto` 依序看客觀訊號，不用 Agent 自填的風險等級：
+  簽章閘門有 breaking → 審；改到 `core_paths` → 審；本任務曾驗證失敗 → 審；小改動（≤`policy.max_files` 檔且
+  ≤`policy.max_lines` 行，預設 2／60）→ **跳過審查只靠測試**；其餘 → 審。介面變更永遠不套用跳過規則。
+- **簽章閘門** `tools/iface_gate.py`：純 AST 比對改動 .py 的公開介面（頂層與 class 內不以底線開頭的 def）：必填參數增加、
+  參數移除、回傳型別改變、公開名稱移除＝breaking；新增公開名稱／選填參數＝additive。陰性對照（重構六組 b7d5df3→master）0 breaking。
+- **結構化審查**：審查指令要求最後一行輸出 `{"verdict":"approve|changes_requested","checks":[...],"unreported":[...]}`；
+  `parse_review` 以 JSON 為準、沒有就退回第一行「可合併／需修改」。
+- **帳本** `runs/usage_ledger.jsonl`：每次呼叫一行（task／role／cli／usage／秒數／failure_class）；`python relay.py --ledger` 看總計。
+  判定器回 `rate_limit` 時 relay 大聲停下（不自動換手——真 429 尚未觀察到）。
+- 三個真任務：`task-index-sync`（policy always，審→approve）、`task-ps1-tests`（auto：3 檔 6 行非核心 → **跳過審查**，
+  兩組驗證含 `tools/check_ps1_encoding.py` BOM／換行／PSParser 檢查）、`task-dashboard-pollers`（auto：dashboard.html 是核心
+  → 送審，agy 回 JSON 七條 pass）。三支分支皆已由人閘門合併上線（目標 repo master `0000000`）。
+
+**仍未做**：換手（實作者固定 Codex、審查者固定 agy）；並行；P4 只記帳不換手。
 
 ### 其他檔案
 
@@ -36,6 +50,9 @@ usage 只記進 HANDOFF 不做撞牆換手；驗證指令由任務檔寫死（�
 | `tools/closure_map.py` | 純 AST 依賴閉包圖（重構棒 1）：每個頂層 def 的閉包碰不碰 db／net／model／route |
 | `tools/deps_of.py` | 指定函式用到的同模組常數、from-import（搬函式前查「還要帶什麼」） |
 | `tools/extract_defs.py` | 把頂層定義往外抽成新模組＋原檔原名 re-export；連同緊貼的註解一起搬；保 CRLF |
+| `tools/iface_gate.py` | 簽章閘門：改動 .py 公開介面的 breaking／additive（純 AST） |
+| `tools/check_ps1_encoding.py` | .ps1 改動後 BOM 數不變、換行不混用、無控制字元、PSParser 0 錯 |
+| `_test_relay.py` | relay 的判準／解析／閘門／帳本純邏輯測試，26 項 |
 | `tools/agy_review.py` | agy 唯讀審查：diff 分塊用 `--continue` 餵進同一對話（命令列 32K 上限、agy 不讀 stdin、給路徑會被軟拒） |
 | `plans/` | 計畫書與閉包圖（目標 repo 重構第一階段） |
 | `tasks/`、`runs/` | relay 的任務定義與執行紀錄 |

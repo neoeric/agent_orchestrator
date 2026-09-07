@@ -34,6 +34,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
+from tools import iface_gate  # noqa: E402
+
+LEDGER = HERE / "runs" / "usage_ledger.jsonl"  # P4：跨任務用量帳本（只記帳，不換手）
 
 PY = os.environ.get("RELAY_PYTHON", r"C:\Users\<user>\AppData\Local\Programs\Python\Python311\python.exe")
 CODEX = os.environ.get("RELAY_CODEX", r"C:\Users\<user>\.vscode\extensions\openai.chatgpt-26.5901.22334-win32-x64\bin\windows-x86_64\codex.exe")
@@ -51,7 +54,73 @@ IMPL_RULES = """【守則，違反即整棒作廢】
 REVIEW_RULES = """你是程式碼審查者，只看 diff 不看實作者的回報。請逐項核對下列條件，每條給 通過／不通過／無法判定 並附 diff 行號當證據；
 最後列「未申報問題」（若無請明說「無」）。不要提修法以外的擴張建議。
 輸出格式：**第一行必須是**「總判定：可合併」或「總判定：需修改」，再逐條，再「未申報問題」。
+**最後一行**再輸出一個單行 JSON（編排器機械讀，前面的文字給人看）：
+{"verdict":"approve"或"changes_requested","checks":[{"id":1,"result":"pass|fail|unknown"},...],"unreported":["..."]}
 """
+
+# ---- P2：難易度判準（客觀訊號，不用 Agent 自填的風險等級）-------------------------------
+POLICY_DEFAULTS = {"max_files": 2, "max_lines": 60}
+
+
+def decide_review(task: dict, changed: list[str], diff: str, verify_failed_any: bool, gate: dict) -> tuple[bool, str]:
+    """回 (要不要送審, 理由)。policy=always/never/auto；auto 依序：介面破壞→審、碰核心→審、驗證曾失敗→審、
+    小改動（檔數≤max_files 且 diff 行數≤max_lines）→跳過只跑測試、其餘→審。介面變更永遠不套用跳過規則。"""
+    pol = task.get("review", {}).get("policy", "always")
+    if pol == "always":
+        return True, "policy=always"
+    if pol == "never":
+        return False, "policy=never"
+    breaking = [f"{k}: {b}" for k, v in gate.items() for b in v.get("breaking", [])]
+    if breaking:
+        return True, "介面破壞性變更：" + "; ".join(breaking[:3])
+    core = task.get("core_paths", [])
+    hit = [c for c in changed if any(c == x or c.startswith(x.rstrip("/") + "/") or (x.endswith("/") and c.startswith(x)) for x in core)]
+    if hit:
+        return True, "碰到核心模組：" + ", ".join(hit[:3])
+    if verify_failed_any:
+        return True, "本任務曾有驗證失敗"
+    lines = sum(1 for l in diff.splitlines() if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---")))
+    lim = {**POLICY_DEFAULTS, **task.get("policy", {})}
+    if len(changed) <= lim["max_files"] and lines <= lim["max_lines"]:
+        return False, f"小改動（{len(changed)} 檔、{lines} 行）且無介面／核心／驗證失敗訊號 → 跳過審查，只靠測試"
+    return True, f"改動量（{len(changed)} 檔、{lines} 行）超過門檻"
+
+
+def parse_review(text: str) -> dict:
+    """優先讀最後一個單行 JSON；沒有就退回看第一行的『可合併／需修改』。"""
+    vals, _ = judge.extract_json_values(text)
+    for v in reversed(vals):
+        if isinstance(v, dict) and v.get("verdict") in ("approve", "changes_requested"):
+            return {"structured": True, "approved": v["verdict"] == "approve",
+                    "checks": v.get("checks", []), "unreported": v.get("unreported", [])}
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    return {"structured": False, "approved": ("可合併" in first) and ("需修改" not in first), "checks": [], "unreported": []}
+
+
+def ledger_append(entry: dict) -> None:
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def ledger_totals() -> dict:
+    tot: dict = {}
+    if not LEDGER.exists():
+        return tot
+    for line in LEDGER.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        u = e.get("usage") or {}
+        t = tot.setdefault(e.get("cli", "?"), {"calls": 0, "input_total": 0, "output": 0, "seconds": 0.0, "rate_limited": 0})
+        t["calls"] += 1
+        t["input_total"] += int(u.get("input_tokens_total") or 0)
+        t["output"] += int(u.get("output_tokens") or 0)
+        t["seconds"] += float(e.get("seconds") or 0)
+        t["rate_limited"] += 1 if e.get("failure_class") == "rate_limit" else 0
+    return tot
+
 
 
 @dataclass
@@ -64,6 +133,8 @@ class CallRecord:
     seconds: float
     usage: dict | None
     stdout_file: str
+    cli: str = ""
+    failure_class: str | None = None
 
 
 @dataclass
@@ -78,6 +149,8 @@ class State:
     verdict: str = ""
     calls: list = field(default_factory=list)
     verify: list = field(default_factory=list)
+    review_decisions: list = field(default_factory=list)
+    iface_gate: dict = field(default_factory=dict)
     started: str = ""
     updated: str = ""
 
@@ -117,6 +190,14 @@ class Run:
 
     def write_current(self, text: str) -> None:
         (self.dir / "CURRENT.md").write_text(text, encoding="utf-8")
+
+    def record(self, rec: CallRecord) -> None:
+        self.state.calls.append(asdict(rec)); self.save()
+        ledger_append({"ts": now(), "task": self.t["id"], "role": rec.role, "cli": rec.cli, "round": rec.round,
+                       "ok": rec.ok, "failure_class": rec.failure_class, "seconds": rec.seconds, "usage": rec.usage})
+        if rec.failure_class == "rate_limit":
+            # P4 只偵測不換手：真正的 429 至今未直接觀察到，先讓它大聲停下來
+            raise RuntimeError(f"撞牆：{rec.cli} 回 rate_limit（{rec.reason}）。本版不自動換手，請人決定換誰。")
 
     def log(self, msg: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -170,8 +251,9 @@ class Run:
                 cwd=self.wt, timeout=self.t.get("impl_timeout", 1500))
         so.write_text(cp.stdout, encoding="utf-8"); se.write_text(cp.stderr, encoding="utf-8"); ex.write_text(f"exit={cp.returncode}", encoding="utf-8")
         v = judge.judge("codex", cp.stdout, cp.stderr, cp.returncode)
-        rec = CallRecord("implementer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(so))
-        self.state.calls.append(asdict(rec)); self.save()
+        rec = CallRecord("implementer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(so),
+                         cli="codex", failure_class=v.failure_class)
+        self.record(rec)
         self.log(f"實作者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s，{v.reason}）usage={v.usage}")
         report = out_last.read_text(encoding="utf-8") if out_last.exists() else (v.result_text or "")
         return v.ok, report, v.usage
@@ -222,13 +304,16 @@ class Run:
         (self.dir / f"review_r{rnd}_tool.log").write_text(cp.stdout + "\n--- stderr ---\n" + cp.stderr, encoding="utf-8")
         obj = json.loads(out_f.read_text(encoding="utf-8")) if out_f.exists() and out_f.stat().st_size else None
         v = judge.judge("agy", json.dumps(obj) if obj else "", cp.stderr, cp.returncode)
-        rec = CallRecord("reviewer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(out_f))
-        self.state.calls.append(asdict(rec)); self.save()
+        rec = CallRecord("reviewer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(out_f),
+                         cli="agy", failure_class=v.failure_class)
+        self.record(rec)
         text = (obj or {}).get("response", "") or ""
-        first = next((l for l in text.splitlines() if l.strip()), "")
-        approved = ("可合併" in first) and ("需修改" not in first)
-        self.log(f"審查者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s）判定行：{first[:40]!r}")
-        return v.ok and approved, text, v.usage
+        pr = parse_review(text)
+        self.state.review_decisions.append({"round": rnd, **{k: v2 for k, v2 in pr.items() if k != "checks"},
+                                            "checks": pr["checks"]}); self.save()
+        self.log(f"審查者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s）判定：{'approve' if pr['approved'] else 'changes_requested'}"
+                 f"{'（結構化）' if pr['structured'] else '（退回字串判斷）'} 未申報 {len(pr['unreported'])} 項")
+        return v.ok and pr["approved"], text, v.usage
 
     # ---- 6. commit -----------------------------------------------------------
     def changed_paths(self) -> list[str]:
@@ -289,8 +374,15 @@ class Run:
 ## 6. 建議下一步
 {'人：審過 HANDOFF 後合併到 base branch、依 repo 紀律部署；編排器不合併不重啟。' if status == 'done' else '人：讀下方審查／驗證輸出決定修法或放棄；worktree 與分支保留。'}
 
+## 審查判準與簽章閘門
+{chr(10).join('- round ' + str(d.get('round')) + '：' + ('送審' if d.get('need_review') else '跳過') + '——' + str(d.get('why')) for d in self.state.review_decisions if 'need_review' in d) or '- （無）'}
+- 簽章閘門：breaking {sum(len(g['breaking']) for g in self.state.iface_gate.values())}、additive {sum(len(g['additive']) for g in self.state.iface_gate.values())}
+{chr(10).join('  - ' + k + ': ' + '; '.join(v['breaking'] + v['additive']) for k, v in self.state.iface_gate.items() if v['breaking'] or v['additive']) or ''}
+- 審查者結構化判定：{[d.get('approved') for d in self.state.review_decisions if 'approved' in d] or '（未送審）'}；未申報問題：{[d.get('unreported') for d in self.state.review_decisions if 'approved' in d] or '—'}
+
 ## 用量（每次呼叫，判定器抽取）
 {chr(10).join(usage_lines)}
+- 帳本累計（所有任務，runs/usage_ledger.jsonl）：{json.dumps(ledger_totals(), ensure_ascii=False)}
 
 ---
 ### 實作者最後一輪回報（原文）
@@ -324,7 +416,22 @@ class Run:
                 feedback = "worktree 沒有任何改動。請照規格實際修改檔案。"
                 self.log("沒有 diff，下一輪")
                 continue
-            r_ok, review_text, _ = self.review(rnd, diff)
+            # P2：簽章閘門 + 難易度判準
+            git(self.wt, "reset", "-q")
+            changed_now = [l[3:].strip() for l in git(self.wt, "status", "--porcelain").stdout.splitlines()
+                           if not (l[:2].strip() == "??" and any(l[3:].strip().startswith(x) for x in self.t.get("ignore_new", ["_refactor/", "views/", "__pycache__"])))]
+            gate = iface_gate.gate_worktree(self.wt, self.t["base_branch"])
+            self.state.iface_gate = gate
+            verify_failed_any = any(r["exit"] != 0 for r in self.state.verify)
+            need_review, why = decide_review(self.t, changed_now, diff, verify_failed_any, gate)
+            self.state.review_decisions.append({"round": rnd, "need_review": need_review, "why": why,
+                                                "changed": changed_now, "breaking": sum(len(g["breaking"]) for g in gate.values())})
+            self.save()
+            self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}")
+            if need_review:
+                r_ok, review_text, _ = self.review(rnd, diff)
+            else:
+                r_ok, review_text = True, f"（依判準跳過審查：{why}）"
             if v_ok and r_ok:
                 self.state.verdict = "converged"
                 break
@@ -364,9 +471,17 @@ class Run:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("task")
+    ap.add_argument("task", nargs="?")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--ledger", action="store_true", help="印出跨任務用量帳本總計")
     a = ap.parse_args(argv)
+    if a.ledger:
+        for cli, t in ledger_totals().items():
+            print(f"{cli:6s} calls={t['calls']} input_total={t['input_total']:,} output={t['output']:,} "
+                  f"seconds={t['seconds']:.0f} rate_limited={t['rate_limited']}")
+        return 0
+    if not a.task:
+        ap.error("缺 task 檔")
     task = json.loads(Path(a.task).read_text(encoding="utf-8"))
     for k in ("id", "repo", "base_branch", "branch", "worktree", "spec_file", "verify", "review"):
         if k not in task:
