@@ -98,6 +98,35 @@ def test_iface_gate() -> None:
     check("新版語法錯誤 → 記成 breaking 不崩潰", any("syntax error" in x for x in r["breaking"]), str(r))
 
 
+    # 2026-09-08 補：與另一台機器的獨立實作（apisig.py）雙向對照後補上的六個漏洞
+    r = iface_gate.compare_sources("class Foo:\n    def __init__(self, a):\n        pass\n",
+                                   "class Foo:\n    def __init__(self, a, b):\n        pass\n")
+    check("__init__ 必填參數增加 → breaking（建構子簽章也是介面）",
+          any("required param added -> b" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("def f(x: str) -> None:\n    pass\n", "def f(x: int) -> None:\n    pass\n")
+    check("參數型別註記改變 → breaking", any("param type changed -> x" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("def f(a, *args):\n    pass\n", "def f(a):\n    pass\n")
+    check("*args 被移除 → breaking", any("*args removed" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("def f(a, **kw):\n    pass\n", "def f(a):\n    pass\n")
+    check("**kwargs 被移除 → breaking", any("**kw removed" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("def f(a):\n    pass\n", "async def f(a):\n    pass\n")
+    check("sync 改 async → breaking（呼叫端不 await 會拿到 coroutine）",
+          any("sync → async" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("class C:\n    def v(self):\n        return 1\n",
+                                   "class C:\n    @property\n    def v(self):\n        return 1\n")
+    check("方法加 @property → breaking（obj.v() 變成 obj.v）",
+          any("裝飾器改變" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources("def f(a, b):\n    pass\n", "def f(a, *, b):\n    pass\n")
+    check("位置參數改成 kw-only → breaking（對方那支漏掉的 case）", r["breaking"] != [], str(r))
+    r = iface_gate.compare_sources("def f(a):\n    pass\n", "def f(a, *args, **kw):\n    pass\n")
+    check("新增 *args/**kwargs → additive 不是 breaking",
+          r["breaking"] == [] and len(r["additive"]) == 2, str(r))
+    r = iface_gate.compare_sources("class C:\n    def v(self):\n        return 1\n",
+                                   "class C:\n    @functools.lru_cache()\n    def v(self):\n        return 1\n")
+    check("非呼叫慣例的裝飾器（@lru_cache）→ 不算（陰性，避免假 breaking）",
+          r == {"breaking": [], "additive": []}, str(r))
+
+
 def test_ledger_totals() -> None:
     orig = relay.LEDGER
     with tempfile.TemporaryDirectory() as d:
