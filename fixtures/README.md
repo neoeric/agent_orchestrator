@@ -7,6 +7,11 @@ Claude 兩份是在 Claude Code 對話內巢狀抓的，抓之前先
 `env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_PID -u CLAUDE_CODE_ENTRYPOINT`
 （預防性，沒有測過不 unset 會不會被擋）。
 
+⚠️ **這些樣本逐字保留，只有一個例外**：四個檔（`agy_ok_plan.stdout.txt`、`gemini_badkey_exit144.txt`、
+`gemini_gca_exit1.txt`、`gemini_noauth_exit41.txt`）裡出現在檔案路徑中的 Windows 使用者名，
+共 16 處已改成 `<user>`。**其餘一個位元組都沒動**——JSON 結構、欄位值、行序、雜訊行、exit code 全是原樣。
+會特別記這一條，是因為這批樣本的價值就在「它是真的」；改過就要說，否則「真實樣本」這個宣稱本身失真。
+
 | 檔案 | CLI／版本 | 怎麼抓 | exit | 重點 |
 |---|---|---|---|---|
 | `claude_ok.*` | Claude Code 2.1.263（擴充內建 `resources\native-binary\claude.exe`） | `claude -p "回覆 OK" --output-format json` | 0 | 單行 JSON；固定開銷 **31,322** input tokens（2＋cache_creation 15,878＋cache_read 15,442）；模型 claude-fable-5-1，`total_cost_usd` 0.32 |
