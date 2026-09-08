@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
-runs/*/impl_r*.stdout.txt
-runs/*/*.stderr.txt
-runs/*/review_r*_agy.json
+
+# 任務定義、計畫與執行紀錄會包含受測專案的程式碼片段與審查原文，預設不進版控。
+# 要分享範本請自行挑選、確認內容後用 git add -f 加入。
+tasks/
+plans/
+runs/
