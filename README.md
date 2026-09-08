@@ -63,10 +63,10 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `repo` / `base_branch` / `branch` / `worktree` | 從 `base_branch` 開 `branch` 到 `worktree`；branch 已存在就沿用 |
 | `production_dir` | 選填但**強烈建議填**：`worktree` 等於它就直接拒跑，防手滑改到生產目錄 |
 | `spec_file` | 給實作者的完全指定規格（相對路徑以編排器目錄為基準） |
-| `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…） |
+| `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
 | `review.policy` | `always`（預設）／`never`／`auto`，判準見下節 |
-| `review.instructions_file` | 給審查者的逐條核對條件 |
+| `review.instructions_file` | 給審查者的逐條核對條件。⚠️ **每一條都必須「只看 diff 就能回答」**——審查者是唯讀、只拿到 diff，不給工具，要求它讀原始檔或附上測試實跑輸出，它結構上做不到，只會回「無法判定」。實跑證據由 `verify[]` 供給 |
 | `core_paths` | `auto` 判準用：碰到就一定送審 |
 | `policy.max_files` / `max_lines` | `auto` 的小改動門檻，預設 2 檔 / 60 行 |
 | `allowed_paths` | commit 時只收這些路徑；沒設就收全部改動 |
@@ -199,6 +199,13 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 - **Gemini 的 exit code 是 HTTP 碼 mod 256**（400 → 144），而且 `error.code` 是 CLI 內部碼不是 HTTP 碼。
 - **Codex 的無頭環境裡 `python`／`py`／`rg` 可能都跑不動**（Windows 上會解析到 WindowsApps stub），
   它自己驗不了測試——這正是「relay 自己跑測試才算數」的由來。
+  ⚠️ **連帶效應**：實作者會如實回報「測試全失敗」，而同一份 HANDOFF 的第 3 節 verify 全 PASS。
+  **兩段方向相反的訊息並排，很容易把成功的一棒讀成失敗的一棒。** 第 3 節已標明它才是權威——讀 HANDOFF 認那一節。
+- 🔑 **寫審查核對條件前，先確定審查者實際做得到**。審查者是唯讀、只拿到 diff、不給工具，
+  所以「附上四個驗證指令的實際輸出」「去讀原始檔第 N 行確認」這類條件它結構上無法滿足，只會回「無法判定」。
+  **判準必須「只看 diff 就能答」；實跑證據由 `verify[]` 供給，不向審查者要。**
+  這條踩過三次（AST 閘門漏判／審查者依指令沒讀外部原始檔＝只驗 diff 內部自洽／規格要求了它做不到的事），
+  共同結論是：**閘門檢查不到的地方，不能假設審查者會自己補。**
 - 在 Claude Code 對話裡巢狀呼叫 `claude -p`，要先 unset `CLAUDECODE` 等環境變數（`fixtures/README.md` 有完整清單）。
 
 ## 還沒做

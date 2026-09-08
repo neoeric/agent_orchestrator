@@ -450,6 +450,10 @@ class Run:
 {chr(10).join('- ' + p for p in paths) if paths else '- （無）'}
 
 ## 3. 測試結果（最後一輪）
+> 🔑 **本節是 relay 自己實跑的結果，是唯一權威。** 下方「實作者最後一輪回報（原文）」的測試自述
+> 僅供參考——實作者的無頭環境常跑不動測試（例如 Windows 上裸 `python` 解析到 WindowsApps stub），
+> 它回報「全部失敗」而本節全 PASS 是**已知且正常**的情況。**兩者不一致時一律以本節為準。**
+
 {verify_summary or '- （未跑）'}
 
 ## 4. 有沒有動到公開介面
