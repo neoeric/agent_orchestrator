@@ -5,6 +5,10 @@
 
 ## 目前有什麼
 
+### /orchestrate skill（上層入口，2026-09-08）
+
+`~/.claude/skills/orchestrate/SKILL.md`：打 `/orchestrate <一句需求>`，主對話會判斷份量（借 ECC `orch-pipeline` 的 size classifier）、寫任務三件套、跑本檔的 relay、讀 `runs/<id>/HANDOFF.md` 回報。合併／部署／重啟仍是人閘門。
+
 ### relay.py — 一個子任務一棒（P1 最小可用版，2026-09-07 晚跑通）
 
 ```text
