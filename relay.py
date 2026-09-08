@@ -35,13 +35,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
-from tools import iface_gate  # noqa: E402
+from tools import iface_gate, paths  # noqa: E402
 
 LEDGER = HERE / "runs" / "usage_ledger.jsonl"  # P4：跨任務用量帳本（只記帳，不換手）
 
-PY = os.environ.get("RELAY_PYTHON", r"C:\Users\<user>\AppData\Local\Programs\Python\Python311\python.exe")
-CODEX = os.environ.get("RELAY_CODEX", r"C:\Users\<user>\.vscode\extensions\openai.chatgpt-26.5901.22334-win32-x64\bin\windows-x86_64\codex.exe")
-AGY = os.environ.get("RELAY_AGY", r"C:\Users\<user>\AppData\Local\agy\bin\agy.exe")
+# 三個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
+PY = paths.resolve_python()
+CODEX = paths.resolve_codex() or "codex"
+AGY = paths.resolve_agy() or "agy"
 AGY_REVIEW = HERE / "tools" / "agy_review.py"
 
 IMPL_RULES = """【守則，違反即整棒作廢】
@@ -568,6 +569,11 @@ def main(argv=None) -> int:
         return 0
     if not a.task:
         ap.error("缺 task 檔")
+    if not a.dry_run:
+        missing = paths.check_all()
+        if missing:
+            print("環境缺少 CLI,無法動工:\n  - " + "\n  - ".join(missing), file=sys.stderr)
+            return 3
     task = json.loads(Path(a.task).read_text(encoding="utf-8"))
     for k in ("id", "repo", "base_branch", "branch", "worktree", "spec_file", "verify", "review"):
         if k not in task:

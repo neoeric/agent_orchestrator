@@ -21,7 +21,9 @@ import sys
 import time
 from pathlib import Path
 
-AGY = os.environ.get("AGY_EXE", r"C:\Users\<user>\AppData\Local\agy\bin\agy.exe")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
+AGY = os.environ.get("AGY_EXE") or paths.resolve_agy() or "agy"
 NO_TOOLS = "不要使用任何工具：不要執行指令、不要讀檔、不要搜尋，只根據對話內容作答。"
 
 
