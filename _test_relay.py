@@ -126,6 +126,26 @@ def test_iface_gate() -> None:
     check("非呼叫慣例的裝飾器（@lru_cache）→ 不算（陰性，避免假 breaking）",
           r == {"breaking": [], "additive": []}, str(r))
 
+    # 2026-09-08 補：同名多定義（property/setter/deleter）——只用名字當 key 會後蓋前，這組全都測不到
+    _prop = ("class C:\n    @property\n    def v(self):\n        return 1\n")
+    _prop_set = (_prop + "    @v.setter\n    def v(self, x):\n        pass\n")
+    _prop_del = (_prop_set + "    @v.deleter\n    def v(self):\n        pass\n")
+    r = iface_gate.compare_sources(_prop_set, _prop_set)
+    check("property getter＋setter 都不動 → clean（陰性）", r == {"breaking": [], "additive": []}, str(r))
+    r = iface_gate.compare_sources(_prop, _prop_set)
+    check("加 setter → additive（property 變可寫＝對呼叫端放寬）",
+          r["breaking"] == [] and any("C.v[setter]" in x for x in r["additive"]), str(r))
+    r = iface_gate.compare_sources(_prop_set, _prop)
+    check("移除 setter → breaking（obj.v = x 會炸）",
+          any("removed: C.v[setter]" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources(_prop_del, _prop_set)
+    check("移除 deleter → breaking（del obj.v 會炸）",
+          any("removed: C.v[deleter]" in x for x in r["breaking"]), str(r))
+    r = iface_gate.compare_sources(_prop_set,
+                                   _prop + "    @v.setter\n    def v(self, x: int):\n        pass\n")
+    check("setter 的參數型別改變 → breaking（兩邊都有該 role 時照舊比簽章）",
+          any("C.v[setter]" in x and "param type changed" in x for x in r["breaking"]), str(r))
+
 
 def test_ledger_totals() -> None:
     orig = relay.LEDGER

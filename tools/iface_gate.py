@@ -2,10 +2,13 @@
 
 公開介面＝頂層不以底線開頭的 def／async def／class，class 內不以底線開頭的方法，以及 __init__
 （建構子的簽章是介面的一部分，雖然名字以底線開頭）。
+同名多定義（`@property` / `@v.setter` / `@v.deleter`）視為三個不同的介面表面，key 為
+`C.v`（getter）／`C.v[setter]`／`C.v[deleter]`——只用名字會後蓋前，「property 變可寫」偵測不到。
 判定：
-  breaking ＝ 移除公開名稱、必填參數增加、參數改名／移除、參數型別註記改變、回傳型別註記改變、
-              *args／**kwargs 被移除、sync↔async 互換、呼叫慣例裝飾器（@property 等）增刪
-  additive ＝ 新增公開名稱、新增選填參數、新增 *args／**kwargs
+  breaking ＝ 移除公開名稱（含移除 setter／deleter：`obj.v = x`／`del obj.v` 會炸）、必填參數增加、
+              參數改名／移除、參數型別註記改變、回傳型別註記改變、*args／**kwargs 被移除、
+              sync↔async 互換、呼叫慣例裝飾器（@property 等）增刪
+  additive ＝ 新增公開名稱（含新增 setter＝property 變可寫）、新增選填參數、新增 *args／**kwargs
 兩者都沒有 ＝ 純內部改動（重構、私有函式）。
 
 用法（程式）：compare_sources(old_src, new_src) -> {"breaking": [...], "additive": [...]}
@@ -32,6 +35,16 @@ def _decorators(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
         if head.split(".")[-1] in _CONVENTION_DECORATORS:
             out.append(head)
     return sorted(out)
+
+
+def _role(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """同名多定義（`@property def v` / `@v.setter def v` / `@v.deleter def v`）是三個不同的介面表面。
+    只用名字當 key 會後蓋前，「property 變可寫／變唯讀」就完全偵測不到。"""
+    for d in fn.decorator_list:
+        tail = ast.unparse(d).split("(")[0].split(".")[-1]
+        if tail in ("setter", "deleter"):
+            return tail
+    return "getter"                                   # 含 @property 與一般方法
 
 
 def _annot(x: ast.arg) -> str | None:
@@ -73,7 +86,10 @@ def public_api(src: str) -> dict[str, dict]:
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
                         not sub.name.startswith("_") or sub.name == "__init__"):
-                    out[f"{node.name}.{sub.name}"] = _sig(sub)
+                    role = _role(sub)
+                    # getter 不加後綴，一般方法的 key 維持 `C.m` 不變；setter／deleter 才另立表面。
+                    key = f"{node.name}.{sub.name}" if role == "getter" else f"{node.name}.{sub.name}[{role}]"
+                    out[key] = _sig(sub)
     return out
 
 
