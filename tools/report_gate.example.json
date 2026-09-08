@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "report_gate.py 的設定範例。每個區塊都可省略，省略就不做該項檢查。",
+    "跑法：cd <報告所在的 repo> && python <本編排器>/tools/report_gate.py <本檔>",
+    "這裡的值是佔位用的通用範例；真實任務的設定放在版控外（本編排器的 tasks/ 已 gitignore），",
+    "因為它會寫滿受測專案的檔名與路由，不該進一個要公開的 repo。"
+  ],
+  "report": "docs/AUDIT-example.md",
+  "min_chars": 2000,
+  "required_sections": [
+    "範圍與方法",
+    "現況清冊",
+    "鮮度分析",
+    "退場候選",
+    "建議處置",
+    "限制與未驗證"
+  ],
+  "path_refs": {
+    "_comment": "檢查報告裡引用的檔案路徑真的存在。guarded_prefixes 是版控外的目錄——worktree 查不到，所以不在 whitelist/wildcard 的一律當可疑，不能靜默放行（否則這道檢查對那些目錄等於沒開）。",
+    "guarded_prefixes": [
+      "pages/"
+    ],
+    "wildcard_prefixes": [
+      "pages/generated/"
+    ],
+    "whitelist": [
+      "pages/index.html",
+      "pages/about.html"
+    ]
+  },
+  "route_refs": {
+    "_comment": "報告提到的路由必須在原始碼裡找得到。pattern 的第 1 個捕獲組＝路由字串。",
+    "source": "app.py",
+    "pattern": "@app\\.(?:get|post)\\(\"([^\"]+)\""
+  },
+  "coverage": {
+    "_comment": "從原始碼抽出「應該被涵蓋的項目」清單，逐一確認報告有提到。block_pattern 先框出那段結構，entry_pattern 再從中抽 (值, 標籤)，兩者任一出現在報告中就算涵蓋。",
+    "source": "app.py",
+    "block_pattern": "entries = \\[(.*?)\\n    \\]",
+    "entry_pattern": "\\(\\s*\"(/[^\"]*|https://[^\"]*)\"\\s*,\\s*\"([^\"]+)\"\\s*,",
+    "min_entries": 10
+  },
+  "table": {
+    "_comment": "結論表的每一列都要有結論詞，避免只列問題不給處置。",
+    "section": "建議處置",
+    "stop_at": "限制與未驗證",
+    "header_words": [
+      "項目",
+      "處置",
+      "理由"
+    ],
+    "verdict_words": [
+      "保留",
+      "更新",
+      "合併",
+      "下架",
+      "標死",
+      "退場",
+      "重產"
+    ],
+    "min_rows": 5
+  }
+}
