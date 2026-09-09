@@ -5,6 +5,8 @@
 
 編排器獨立安裝一次，用 `git worktree` 在隔離目錄裡改碼，**永遠不碰你的生產目錄**。
 
+> **用 Claude Code 的人**：有一支 `orchestrate` skill 把「判任務→寫三檔→建 LF worktree→跑 relay→人閘門」整套流程與坑固化好了，打 `/orchestrate` 或說「跑一棒」即可。skill 內容見 `~/.claude/skills/orchestrate/SKILL.md`。
+
 ## 設計前提
 
 1. **工人說「做好了」不算數。** 每一輪都由 relay 自己跑你指定的驗證指令，全部 exit 0 才算過。
