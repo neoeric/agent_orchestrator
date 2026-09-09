@@ -65,6 +65,8 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `spec_file` | 給實作者的完全指定規格（相對路徑以編排器目錄為基準） |
 | `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
+| `python` | 選填：verify／prebuild／陰性對照要用的 Python（例如專案 venv 的 `python.exe`）。沒設就用跑 relay 的那支直譯器；當 verify 需要的依賴只在專案 venv、而 relay 跑在別的 python 時設它（否則會拿到「缺依賴」的假紅燈）|
+| `negative_controls` | 選填：`[{target, old, new, verify_name?, expected_failure}]`。verify 綠**之後**，對每條把 `target`（worktree 內相對路徑）裡的 `old` 換成 `new`（一個真違規）、重跑 `verify_name`（省略=第一條 verify）、確認它**紅在 `expected_failure` 這個標記**、再逐位元組還原。任何一條「注入後沒紅在指定處」= 那條斷言是空的 ⇒ 整棒判 fail。把機器審從「斷言**在不在**」升級到「斷言**真的抓得到**」——就是人工重審在做的那件事 |
 | `review.policy` | `always`（預設）／`never`／`auto`，判準見下節 |
 | `review.instructions_file` | 給審查者的逐條核對條件。⚠️ **每一條都必須「只看 diff 就能回答」**——審查者是唯讀、只拿到 diff，不給工具，要求它讀原始檔或附上測試實跑輸出，它結構上做不到，只會回「無法判定」。實跑證據由 `verify[]` 供給 |
 | `core_paths` | `auto` 判準用：碰到就一定送審 |

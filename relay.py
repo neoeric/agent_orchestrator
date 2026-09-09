@@ -35,7 +35,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
-from tools import iface_gate, paths  # noqa: E402
+from tools import iface_gate, inject_check, paths  # noqa: E402
 
 LEDGER = HERE / "runs" / "usage_ledger.jsonl"  # P4：跨任務用量帳本（只記帳，不換手）
 
@@ -47,7 +47,7 @@ AGY_REVIEW = HERE / "tools" / "agy_review.py"
 
 IMPL_RULES = """【守則，違反即整棒作廢】
 - 你在隔離 worktree 裡工作；生產目錄與其他任何目錄絕對不要碰。不要 git commit、不要 push、不要啟動任何服務、
-  不要跑會載入模型的測試（規格列的驗證指令除外）。不要修改 D:\\Tooling\\agent_orchestrator 底下任何檔案。
+  **規格列的驗證指令由 relay 執行、不是你**——你的沙箱裡常沒有可用的 Python 3（裸 python 多是 2.7、專案 Python 3 可能被沙箱擋），硬跑只會浪費大量時間且完全不影響判定；你只要改好碼、做唯讀 diff 稽核、回報，不要自己跑那些驗證指令，也不要跑會載入模型的測試。不要修改 D:\\Tooling\\agent_orchestrator 底下任何檔案。
 - 只做規格寫的事，不順手擴張；規格沒寫的檔案不要動。
 - 做完用「六欄交接簿」回報：1.完成了什麼 2.改了哪些檔（各幾行） 3.測試結果（指令＋通過數／總數，分「本次新增／既有紅燈／未跑」）
   4.有沒有動到公開介面（函式簽章、路由；有就列簽章） 5.目前卡點 6.建議下一步。
@@ -301,10 +301,12 @@ class Run:
         base = git(self.repo, "rev-parse", "--short", t["base_branch"]).stdout.strip()
         self.state.base_commit = base
         if not Path(self.wt).exists():
-            r = git(self.repo, "worktree", "add", "-b", t["branch"], self.wt, t["base_branch"], timeout=300)
+            # -c core.autocrlf=false：checkout 成 LF、與 git blob 一致。在 core.autocrlf=true
+            # 的機器上，worktree 會被轉成 CRLF，撞到以 LF 內容釘死的 SHA 類斷言（假紅）。
+            r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", "-b", t["branch"], self.wt, t["base_branch"], timeout=300)
             if r.returncode != 0:
                 # 分支可能已存在：直接掛上
-                r = git(self.repo, "worktree", "add", self.wt, t["branch"], timeout=300)
+                r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", self.wt, t["branch"], timeout=300)
             if r.returncode != 0:
                 raise RuntimeError("worktree add 失敗：" + r.stderr[-400:])
             self.log(f"worktree 建立 {self.wt}（{t['branch']} ← {t['base_branch']}@{base}）")
@@ -313,7 +315,7 @@ class Run:
         self.state.branch, self.state.worktree = t["branch"], self.wt
         for cmd in t.get("prebuild", []):
             self.log(f"prebuild: {cmd}")
-            cmd_py = cmd.replace("python ", f'"{PY}" ', 1) if cmd.startswith("python ") else cmd
+            cmd_py = cmd.replace("python ", f'"{self.t.get("python") or PY}" ', 1) if cmd.startswith("python ") else cmd
             r = subprocess.run(cmd_py, cwd=self.wt, shell=True, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", env=dict(os.environ, PYTHONUTF8="1"), timeout=900)
             if r.returncode != 0:
@@ -354,7 +356,7 @@ class Run:
                 self.log(f"[dry] verify {name}: {cmd}")
                 continue
             self.log(f"驗證 {name}: {cmd}")
-            cmd_py = cmd.replace("python ", f'"{PY}" ', 1) if cmd.startswith("python ") else cmd
+            cmd_py = cmd.replace("python ", f'"{self.t.get("python") or PY}" ', 1) if cmd.startswith("python ") else cmd
             t0 = time.monotonic()
             cp = stream(cmd_py, "VERIFY", _verify_line, cwd=self.wt, shell=True,
                         env=item.get("env", {}), timeout=item.get("timeout", 1800), logf=self.dir / "relay.log")
@@ -368,6 +370,44 @@ class Run:
         summary = "\n".join(f"- {r['name']}: {'PASS' if r['exit']==0 else 'FAIL'} (exit {r['exit']})\n  " + r["tail"].replace("\n", "\n  ")
                             for r in results)
         return all_ok, summary
+
+    # ---- 3b. 陰性對照：verify 綠之後，證明新斷言真的抓得到違規（不是只存在）--------------
+    def negative_control(self, rnd: int) -> tuple[bool, str]:
+        """對每條 negative_controls 注入一個真違規、重跑對應 verify、確認它紅在指定 marker、還原。
+        任何一條「注入後沒紅在指定處」= 那條斷言是空的 ⇒ 整棒判 fail（機器審從『斷言在不在』
+        升級到『斷言真的抓得到』）。設定見 README。"""
+        controls = self.t.get("negative_controls", [])
+        if not controls:
+            return True, "（無 negative_controls）"
+        verify_by_name = {v["name"]: v for v in self.t.get("verify", [])}
+        py_exe = self.t.get("python") or PY
+        lines, all_ok = [], True
+        for nc in controls:
+            tgt = nc["target"]
+            vname = nc.get("verify_name") or (self.t.get("verify") or [{}])[0].get("name")
+            vitem = verify_by_name.get(vname)
+            if vitem is None:
+                all_ok = False
+                lines.append(f"- {tgt}: 找不到 verify 名稱 {vname!r}")
+                continue
+            if self.dry:
+                self.log(f"[dry] 陰性對照 {tgt}: 注入 → 期望 verify {vname} 紅在 {nc['expected_failure']!r}", prefix="NEGCTL")
+                continue
+            cmd = vitem["cmd"]
+            cmd_py = cmd.replace("python ", f'"{py_exe}" ', 1) if cmd.startswith("python ") else cmd
+            try:
+                # verify 是 shell 字串（跟 verify() 一樣用 shell 跑），inject_check 以 shell=True 執行
+                inject_check.run_injection_check(
+                    str(Path(self.wt) / tgt), nc["old"], nc["new"], cmd_py, nc["expected_failure"],
+                    cwd=self.wt, timeout=vitem.get("timeout", 300), shell=True,
+                    report=lambda m: self.log(m, prefix="NEGCTL"),
+                )
+                lines.append(f"- {tgt}: 注入後正確紅在 {nc['expected_failure']!r} ✓")
+            except inject_check.InjectionCheckError as exc:
+                all_ok = False
+                lines.append(f"- {tgt}: 陰性對照未過 [{exc.step}] {exc}")
+                self.log(f"陰性對照 FAIL [{exc.step}]: {exc}", prefix="NEGCTL")
+        return all_ok, "\n".join(lines)
 
     # ---- 4. 審查 -------------------------------------------------------------
     def diff_for_review(self) -> str:
@@ -519,20 +559,23 @@ class Run:
                                                 "changed": changed_now, "breaking": sum(len(g["breaking"]) for g in gate.values())})
             self.save()
             self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}", prefix="JUDGE")
+            nc_ok, nc_summary = self.negative_control(rnd) if v_ok else (True, "")
             if need_review:
                 r_ok, review_text, _ = self.review(rnd, diff)
             else:
                 r_ok, review_text = True, f"（依判準跳過審查：{why}）"
-            if v_ok and r_ok:
+            if v_ok and nc_ok and r_ok:
                 self.state.verdict = "converged"
                 break
             fb = []
             if not v_ok:
                 fb.append("【驗證未過】\n" + verify_summary)
+            if not nc_ok:
+                fb.append("【陰性對照未過：新斷言沒抓到被注入的違規】\n" + nc_summary)
             if not r_ok:
                 fb.append("【審查判定需修改，原文】\n" + review_text)
             feedback = "\n\n".join(fb)
-            self.log(f"round {rnd} 未收斂（verify={'ok' if v_ok else 'fail'} review={'ok' if r_ok else 'fail'}）")
+            self.log(f"round {rnd} 未收斂（verify={'ok' if v_ok else 'fail'} negctl={'ok' if nc_ok else 'fail'} review={'ok' if r_ok else 'fail'}）")
         else:
             self.state.verdict = "escalate"
 
