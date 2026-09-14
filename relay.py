@@ -382,7 +382,7 @@ class Run:
         instr_f.write_text(instr, encoding="utf-8"); diff_f.write_text(diff, encoding="utf-8")
         if self.dry:
             self.log(f"[dry] agy review（round {rnd}，diff {len(diff)} 字）")
-            return True, "(dry)", None
+            return True, "(dry)", None, True
         self.log(f"審查者 agy 開跑（round {rnd}，diff {len(diff.encode('utf-8'))} bytes）…")
         t0 = time.monotonic()
         cp = stream([PY, str(AGY_REVIEW), "--instructions", str(instr_f), "--diff", str(diff_f), "--out", str(out_f)],
@@ -398,9 +398,14 @@ class Run:
         pr = parse_review(text)
         self.state.review_decisions.append({"round": rnd, **{k: v2 for k, v2 in pr.items() if k != "checks"},
                                             "checks": pr["checks"]}); self.save()
-        self.log(f"審查者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s）判定：{'approve' if pr['approved'] else 'changes_requested'}"
+        if not v.ok:
+            # 2026-09-14：審查「工具」故障（沒有 JSON／子行程崩潰，例如 diff 單行超過 Windows 命令列上限）
+            # 不是審查「退回」。以前兩者混在一起＝把空的修正要求送給實作者空轉一輪。呼叫端看第四個回傳值。
+            self.log(f"審查工具故障（{v.failure_class or 'unknown'}：{v.reason}）——不是審查退回，本輪不送實作者", prefix="JUDGE")
+        self.log(f"審查者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s）判定："
+                 f"{'工具故障' if not v.ok else ('approve' if pr['approved'] else 'changes_requested')}"
                  f"{'（結構化）' if pr['structured'] else '（退回字串判斷）'} 未申報 {len(pr['unreported'])} 項")
-        return v.ok and pr["approved"], text, v.usage
+        return v.ok and pr["approved"], text, v.usage, v.ok
 
     # ---- 6. commit -----------------------------------------------------------
     def changed_paths(self) -> list[str]:
@@ -520,9 +525,14 @@ class Run:
             self.save()
             self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}", prefix="JUDGE")
             if need_review:
-                r_ok, review_text, _ = self.review(rnd, diff)
+                r_ok, review_text, _, tool_ok = self.review(rnd, diff)
             else:
-                r_ok, review_text = True, f"（依判準跳過審查：{why}）"
+                r_ok, review_text, tool_ok = True, f"（依判準跳過審查：{why}）", True
+            if not tool_ok:
+                # 審查工具故障：停下來給人，不開下一輪（實作沒問題時再跑一輪只是燒錢）
+                self.state.verdict = "review_tool_failure"
+                self.log("審查工具故障，停止（不開下一輪）；修好 tools/agy_review.py 後重跑，或人工審查 review_r*_diff.txt")
+                break
             if v_ok and r_ok:
                 self.state.verdict = "converged"
                 break
@@ -553,8 +563,12 @@ class Run:
             paths = self.changed_paths()
         except RuntimeError as e:
             paths = [f"（{e}）"]
-        self.handoff("escalate", impl_report, verify_summary, review_text, paths,
-                     f"{self.state.round} 輪未收斂（驗證或審查不過），已停止；worktree 保留供人接手。")
+        if self.state.verdict == "review_tool_failure":
+            blocker = (f"審查工具故障（round {self.state.round}：agy_review 沒有回傳 JSON／子行程崩潰）。實作與驗證結果見上；"
+                       "修好 tools/agy_review.py 後重跑 relay，或人工審 review_r*_diff.txt；worktree 改動保留、未 commit。")
+        else:
+            blocker = f"{self.state.round} 輪未收斂（驗證或審查不過），已停止；worktree 保留供人接手。"
+        self.handoff("escalate", impl_report, verify_summary, review_text, paths, blocker)
         self.write_current(f"# CURRENT\n\n任務 {self.t['id']} **未收斂**，已升給人。看 HANDOFF.md。\n")
         self.log("未收斂，升給人")
         return 2
