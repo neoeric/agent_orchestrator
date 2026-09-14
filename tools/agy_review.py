@@ -45,16 +45,38 @@ def run_agy(prompt: str, cont: bool, timeout: int) -> tuple[dict | None, str, in
     return obj, cp.stderr, cp.returncode
 
 
+def _split_long_line(line: str, size: int) -> list[str]:
+    """單行就超過一塊上限時硬切成多段（UTF-8 位元組計、字元邊界），每段尾加續行標記。
+
+    2026-09-14 實際踩到：gateway_reviewer 的 engine.py 第 76 行 RULE_VERSION 註解是一條 ~75KB 的
+    單行，改版本號＝diff 帶新舊兩份 ⇒ 一塊 150KB ⇒ CreateProcess WinError 206「檔名或副檔名太長」，
+    review 工具崩潰、relay 把崩潰當成 changes_requested 送實作者空轉一輪。不截斷（審查者要看到全文），只切。"""
+    if len(line.encode("utf-8")) <= size:
+        return [line]
+    pieces, buf, n = [], [], 0
+    body = line.rstrip("\n")
+    for ch in body:
+        b = len(ch.encode("utf-8"))
+        if n + b > size and buf:
+            pieces.append("".join(buf) + "⤶(此行未完，下段續)\n")
+            buf, n = [], 0
+        buf.append(ch)
+        n += b
+    pieces.append("".join(buf) + "\n")
+    return pieces
+
+
 def chunks(text: str, size: int) -> list[str]:
     out, buf = [], []
     n = 0
-    for line in text.splitlines(keepends=True):
-        b = len(line.encode("utf-8"))
-        if n + b > size and buf:
-            out.append("".join(buf))
-            buf, n = [], 0
-        buf.append(line)
-        n += b
+    for raw in text.splitlines(keepends=True):
+        for line in _split_long_line(raw, size - 200):  # 留 200 bytes 給續行標記與換行
+            b = len(line.encode("utf-8"))
+            if n + b > size and buf:
+                out.append("".join(buf))
+                buf, n = [], 0
+            buf.append(line)
+            n += b
     if buf:
         out.append("".join(buf))
     return out
