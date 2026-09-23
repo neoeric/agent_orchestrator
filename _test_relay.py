@@ -164,8 +164,50 @@ def test_ledger_totals() -> None:
     relay.LEDGER = orig
 
 
+def test_diff_for_review() -> None:
+    """搬檔任務的審查 diff 必須呈現 rename（2026-09-23 gw-layout-p2b round 1 假退回）。
+
+    病灶：`diff_for_review()` 原本先 `git add --intent-to-add --all` 再 `git diff`（index vs 工作樹）。
+    (A) 未暫存刪除＋未追蹤新檔：`--all` 把刪除收進 index，`git diff` 從此看不到刪除，審查者只看到
+        N 個 new file、判成「複製不是搬移」退回（真實發生）。
+    (B) 實作者用 git mv 暫存好：index==工作樹，`git diff` 對那些檔一片空白。
+    兩種狀態都要呈現 `rename from/to`，才算修好。用 20 行同內容檔讓相似度＝100%。
+    """
+    import shutil
+    import subprocess
+
+    def g(wt: str, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as d:
+        wt = str(Path(d) / "wt")
+        Path(wt, "tools").mkdir(parents=True)
+        g(wt, "init", "-q"); g(wt, "config", "user.email", "t@t"); g(wt, "config", "user.name", "t")
+        Path(wt, "tools", "a.py").write_text("a = 1\n" * 20, encoding="utf-8")
+        g(wt, "add", "-A"); g(wt, "commit", "-qm", "base")
+        r = relay.Run({"id": "_test_diff_for_review", "worktree": wt, "repo": wt}, dry=True)
+        try:
+            # (A) 純檔案系統搬移：舊路徑未暫存刪除、新路徑未追蹤
+            Path(wt, "tools", "local").mkdir()
+            shutil.move(str(Path(wt, "tools", "a.py")), str(Path(wt, "tools", "local", "a.py")))
+            d_a = r.diff_for_review()
+            check("審查 diff (A) 未暫存刪除＋未追蹤新檔 → 呈現 rename",
+                  "rename from tools/a.py" in d_a and "rename to tools/local/a.py" in d_a, d_a[:300])
+            check("審查 diff (A) 沒把搬移呈現成純新增（new file）", "new file mode" not in d_a, d_a[:300])
+            g(wt, "reset", "-q"); g(wt, "checkout", "-q", "--", "."); shutil.rmtree(Path(wt, "tools", "local"))
+            # (B) 實作者用 git mv 暫存好
+            Path(wt, "tools", "local").mkdir()
+            g(wt, "mv", "tools/a.py", "tools/local/a.py")
+            d_b = r.diff_for_review()
+            check("審查 diff (B) git mv 暫存好 → 仍呈現 rename（不是空 diff）",
+                  "rename from tools/a.py" in d_b and len(d_b) > 0, f"len={len(d_b)} {d_b[:200]}")
+            g(wt, "reset", "-q")
+        finally:
+            shutil.rmtree(relay.HERE / "runs" / "_test_diff_for_review", ignore_errors=True)
+
+
 def main() -> int:
-    for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals):
+    for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review):
         print(f"--- {fn.__name__} ---")
         fn()
     print(f"\n{PASSED} passed / {len(FAILED)} failed")
