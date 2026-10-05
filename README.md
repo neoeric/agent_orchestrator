@@ -80,11 +80,17 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 
 ```text
 PYTHONUTF8=1 python relay.py tasks/my-task.json
-PYTHONUTF8=1 python relay.py tasks/my-task.json --dry-run   # 只印計畫，不呼叫任何 CLI
+PYTHONUTF8=1 python relay.py tasks/my-task.json --dry-run   # 只印計畫，不呼叫任何 CLI（寫到 runs/<id>.dry/）
+PYTHONUTF8=1 python relay.py tasks/my-task.json --queue     # 並行名額滿了就排隊（見「並行」）
+PYTHONUTF8=1 python relay.py --status   # 所有棒的階段、輪次、耗時、是否等人（--all 看全部）
 PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 ```
 
 `PYTHONUTF8=1` 在 Windows 是必要的，否則輸出非 ASCII 會直接 cp950 crash。
+
+`--status` 的「等人？」欄：`跑中`／`排隊中`（任務鎖有人持有）、`待合併 <commit>`、
+`要人看（未收斂／審查工具故障／撞牆／中止：原因）`、`中斷？（行程已不在）`（STATE 停在中途但任務鎖沒人持有＝
+行程被硬殺或關機，重跑即可）。判活只看任務鎖，不看 STATE 寫什麼；預設列最近 15 筆。
 
 ## 一棒的流程
 
@@ -136,14 +142,50 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 | 檔案 | 內容 |
 |---|---|
 | `CURRENT.md` | 接手的人第一眼看這份 |
-| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage |
+| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage；含中止原因，relay 被例外中止時階段記為 `aborted` |
 | `HANDOFF.md` | 六欄交接簿，含實作者與審查者原文 |
 | `relay.log` | 完整時序 |
 | `impl_r*` / `review_r*` / `verify_r*` | 每輪的 prompt、diff、審查指令、驗證輸出 |
 | `runs/usage_ledger.jsonl` | 跨任務帳本，每次呼叫一行（task／role／cli／usage／秒數／failure_class） |
+| `runs/.locks/` | 並行鎖檔（空檔，不必手動刪；見「並行」） |
+
+`--dry-run` 寫到 `runs/<id>.dry/`，不覆蓋真實紀錄。
 
 > `tasks/`、`runs/`、`plans/` 預設不進版控（見 `.gitignore`）——它們會包含**你自己專案的程式碼片段與審查原文**。
 > 要分享任務範本請自行挑選、確認內容後再加。
+
+## 並行
+
+預設一次一棒。要同時跑不同任務，設環境變數 `RELAY_MAX_PARALLEL`（預設 1、上限 3；非數字當 1、超過夾到 3，都會印警告）。
+
+- 名額由**每個 relay 行程自己守**（`runs/.locks/slot-*.lock`）：滿了直接拒跑（exit 3）；加 `--queue` 則排隊、每 30 秒重試
+  （不保證先來先跑，Ctrl-C 放棄），`--status` 顯示「排隊中」。
+- 一定會擋：同一個 task id 同時跑兩次、兩個任務用同一個 `worktree` 路徑。同一 repo 的 `git worktree add` 與 commit 互斥
+  （各只佔幾秒），不同分支可以並行。帳本 append 也有鎖。
+- 行程被硬殺時 OS 會自動釋放它的鎖，下次直接拿得到；`--status` 把那棒顯示成「中斷？」，重跑時 relay.log 記一行
+  「前一次行程…沒有收尾」。鎖只在同一份 relay 安裝目錄內有效；`--dry-run` 不取任何鎖。
+- agy 審查一律以第 1 塊回傳的 conversation id 釘住對話；拿不到 id 就當審查工具故障停下（不退回 `--continue`：它接
+  「最近一個對話」，並行時會接到別棒的審查）。
+
+relay 管不到、並行前要自己確認的：
+
+| 共用物 | 風險 |
+|---|---|
+| verify 用到的固定 port、專案外固定路徑、載模型 | 兩棒同時跑會互撞或吃光記憶體——這種任務不要並行 |
+| agy／Codex 的本機狀態目錄（`~/.gemini/antigravity-cli/`、`~/.codex/`） | 並行未實測 |
+| 訂閱額度 | 並行＝同時燒兩份 |
+| 終端機輸出 | 會交錯；各自導檔（下例） |
+
+兩棒背景啟動（PowerShell，在編排器目錄、`runs/` 已存在）：
+
+```powershell
+$env:PYTHONUTF8 = "1"; $env:RELAY_MAX_PARALLEL = "2"
+foreach ($id in "task-a", "task-b") {
+  Start-Process python -ArgumentList "relay.py", "tasks/$id.json" -WindowStyle Hidden `
+    -RedirectStandardOutput "runs/$id.console.txt" -RedirectStandardError "runs/$id.console.err.txt"
+}
+python relay.py --status
+```
 
 ## judge.py 可以單獨用
 
@@ -167,13 +209,14 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 | `extract_defs.py` | 把頂層定義抽成新模組並在原檔原名 re-export；連緊貼的註解一起搬，保 CRLF |
 | `iface_gate.py` | 簽章閘門：公開介面的 breaking／additive 判定 |
 | `check_ps1_encoding.py` | .ps1 改動後 BOM 數不變、換行不混用、無控制字元、PSParser 0 錯 |
-| `agy_review.py` | agy 唯讀審查：diff 分塊餵進同一對話，用第 1 塊回傳的 conversation id 以 `--conversation <id>` 釘住（不用 `--continue`：它接「最近一個對話」，你同時在終端用 agy 會接錯）；命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒 |
+| `agy_review.py` | agy 唯讀審查：diff 分塊餵進同一對話，用第 1 塊回傳的 conversation id 以 `--conversation <id>` 釘住（不用 `--continue`：它接「最近一個對話」，你同時在終端用 agy 或並行跑別棒會接錯；第 1 塊沒回 id 就 exit 1 停下）；命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒 |
+| `runlock.py` | 跨行程檔案鎖（任務／worktree／並行名額／repo／帳本）；Windows `msvcrt`、POSIX `flock`，行程死掉 OS 自動釋放 |
 
 ## 測試
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本純邏輯，55 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行，93 項
 ```
 
 `fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓），判定器契約測試靠它。
@@ -225,5 +268,5 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 ## 還沒做
 
 - **換手**：實作者固定 Codex、審查者固定 agy，判定器回 `rate_limit` 時 relay 只會大聲停下，不自動換另一家。
-- **並行**：一次一棒。
+- **批次啟動器**：並行要自己開兩個行程（每個行程自己守 RELAY_MAX_PARALLEL 名額），沒有一個指令跑一批的 launcher。
 - 帳本只記帳，沒有據以調度。

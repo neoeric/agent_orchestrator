@@ -1,12 +1,18 @@
-"""_test_relay.py — relay 的 P2／P4 純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本總計。
+"""_test_relay.py — relay 的純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本、改動判定、
+陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）。不呼叫任何 AI CLI。
 
 跑法：PYTHONUTF8=1 python _test_relay.py   （exit 0＝全過）
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +31,13 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     else:
         FAILED.append(name)
         print(f"[FAIL] {name}" + (f"\n       {detail}" if detail else ""))
+
+
+def rm_runs(tid: str) -> None:
+    """清掉測試產生的 runs/<id> 與 runs/<id>.dry（2026-10-05 起 dry-run 寫 .dry）。"""
+    import shutil
+    for name in (tid, tid + ".dry"):
+        shutil.rmtree(relay.HERE / "runs" / name, ignore_errors=True)
 
 
 def diff_of(n_lines: int) -> str:
@@ -203,7 +216,7 @@ def test_diff_for_review() -> None:
                   "rename from tools/a.py" in d_b and len(d_b) > 0, f"len={len(d_b)} {d_b[:200]}")
             g(wt, "reset", "-q")
         finally:
-            shutil.rmtree(relay.HERE / "runs" / "_test_diff_for_review", ignore_errors=True)
+            rm_runs("_test_diff_for_review")
 
 def test_worktree_changes() -> None:
     """B4（2026-10-05）：判改動改用內容比對＋`-z`，只差行尾的檔不算改動、中文檔名不亂碼。
@@ -301,15 +314,302 @@ def test_negative_control_timeout() -> None:
         shutil.rmtree(relay.HERE / "runs" / "_test_nc_timeout", ignore_errors=True)
 
 
-def main() -> int:
-    for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
-               test_worktree_changes, test_negative_control_timeout):
-        print(f"--- {fn.__name__} ---")
+def test_status() -> None:
+    """C1（2026-10-05）：relay.py --status。判活只看任務鎖；例外中止要落檔；dry-run 不覆蓋真實紀錄。"""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    def st(tid: str, phase: str, **kw) -> dict:
+        return {"task_id": tid, "phase": phase, "round": 1, "max_rounds": 2,
+                "started": "2026-10-05T10:00:00+0800", "updated": "2026-10-05T10:30:00+0800", **kw}
+
+    def row(s: dict, alive: bool = False) -> dict:
+        return relay.status_rows([s], {s["task_id"]: alive}, now)[0]
+
+    # 1. 等人？規則（8 項）
+    w = row(st("a", "done", commit="abc1234"))["waiting"]
+    check("等人？done → 待合併 abc1234", w == "待合併 abc1234", w)
+    w = row(st("a", "escalate", verdict="review_tool_failure"))["waiting"]
+    check("等人？escalate＋review_tool_failure → 要人看（審查工具故障）", w == "要人看（審查工具故障）", w)
+    w = row(st("a", "escalate", verdict="escalate"))["waiting"]
+    check("等人？escalate → 要人看（未收斂）", w == "要人看（未收斂）", w)
+    w = row(st("a", "aborted", abort_reason="撞牆：codex 回 rate_limit"))["waiting"]
+    check("等人？aborted → 含中止原因", w.startswith("要人看（中止：") and "撞牆" in w, w)
+    w = row(st("a", "implement"), alive=True)["waiting"]
+    check("等人？鎖有人持有 → 跑中", w == "跑中", w)
+    w = row(st("a", "queued"), alive=True)["waiting"]
+    check("等人？鎖有人持有＋queued → 排隊中", w == "排隊中", w)
+    w = row(st("a", "review"), alive=False)["waiting"]
+    check("等人？非終態＋鎖沒人持有 → 中斷？", w.startswith("中斷？"), w)
+    w = row({"task_id": "a", "_bad": True})["waiting"]
+    check("等人？_bad → 讀取失敗", "讀取失敗" in w, w)
+    # 2. 耗時與輪次（3 項）
+    e = row(st("a", "implement"), alive=True)["elapsed"]
+    check("耗時：活著用 now − started（10:00→12:00＝2時0分）", e == "2時0分", e)
+    e = row(st("a", "escalate"), alive=False)["elapsed"]
+    check("耗時：不在了用 updated − started（10:00→10:30＝30分）", e == "30分", e)
+    old = st("a", "escalate", round=2)
+    del old["max_rounds"]
+    r = row(old)["round"]
+    check("輪次：舊 STATE 沒有 max_rounds → 2/?", r == "2/?", r)
+    # 3. 排序與 limit（1 項）
+    states = [st("old", "done", updated="2026-10-05T09:00:00+0800"), st("newest", "done", updated="2026-10-05T11:00:00+0800"),
+              st("mid", "done", updated="2026-10-05T10:00:00+0800")]
+    out = relay.render_status(relay.status_rows(states, {}, now), 2)
+    body = out.splitlines()[1:3]
+    check("排序與 limit：limit=2 只出最新兩筆（新到舊）",
+          body[0].startswith("newest") and body[1].startswith("mid") and "old " not in out and "另有 1 筆" in out, out)
+    # 4. collect_states（1 項）
+    with tempfile.TemporaryDirectory() as d:
+        rd = Path(d)
+        for name, text in (("ok", json.dumps(st("ok", "done"))), ("x.dry", json.dumps(st("x", "review"))),
+                           ("_tmp", json.dumps(st("_tmp", "review"))), ("bad", "{not json")):
+            (rd / name).mkdir()
+            (rd / name / "STATE.json").write_text(text, encoding="utf-8")
+        (rd / "nostate").mkdir()
+        got = relay.collect_states(rd)
+        check("collect_states：略過 *.dry／_ 開頭／無 STATE，壞 JSON → _bad",
+              sorted((g["task_id"], bool(g.get("_bad"))) for g in got) == [("bad", True), ("ok", False)], str(got))
+    # 5. 中文寬度（1 項）
+    check("_disp_width('中a') == 3", relay._disp_width("中a") == 3)
+    # 6. main(["--status"]) 不需要任何 CLI（2 項）
+    orig_here, orig_check = relay.HERE, relay.paths.check_all
+
+    def boom(*a, **kw):
+        raise AssertionError("--status 不該呼叫 paths.check_all")
+
+    with tempfile.TemporaryDirectory() as d:
         try:
-            fn()
-        except Exception as exc:  # 改前（函式還不存在）要紅得有名字，不要整支崩潰
-            FAILED.append(f"{fn.__name__} 例外：{exc!r}")
-            print(f"[FAIL] {fn.__name__} 例外：{exc!r}")
+            relay.HERE, relay.paths.check_all = Path(d), boom
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = relay.main(["--status"])
+            check("main(--status)：runs/ 不存在 → return 0、印（沒有任何紀錄）、不呼叫 check_all",
+                  rc == 0 and "（沒有任何紀錄）" in buf.getvalue(), f"rc={rc} out={buf.getvalue()!r}")
+            (Path(d) / "runs" / "t1").mkdir(parents=True)
+            (Path(d) / "runs" / "t1" / "STATE.json").write_text(json.dumps(st("t1", "done", commit="deadbee")), encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = relay.main(["--status", "--all"])
+            check("main(--status --all)：有紀錄 → 表頭＋該列（待合併）", rc == 0 and "等人？" in buf.getvalue()
+                  and "t1" in buf.getvalue() and "待合併 deadbee" in buf.getvalue(), buf.getvalue())
+        finally:
+            relay.HERE, relay.paths.check_all = orig_here, orig_check
+    # 7. Run.abort（1 項）
+    tid = "_test_abort"
+    try:
+        r = relay.Run({"id": tid, "worktree": ".", "repo": ".", "title": "t", "max_rounds": 3}, dry=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r.abort("TimeoutExpired: git 逾時（測試）")
+        s = json.loads((r.dir / "STATE.json").read_text(encoding="utf-8"))
+        cur = (r.dir / "CURRENT.md").read_text(encoding="utf-8")
+        check("Run.abort：STATE 階段 aborted、abort_reason 落檔、CURRENT.md 含原因",
+              s["phase"] == "aborted" and s["abort_reason"].startswith("TimeoutExpired") and "git 逾時" in cur
+              and s["max_rounds"] == 3 and s["pid"] == os.getpid(), str(s)[:300])
+    finally:
+        rm_runs(tid)
+    # 8. dry-run 寫 runs/<id>.dry/、不取鎖（2 項）
+    tid = "_test_dry_dir"
+    with tempfile.TemporaryDirectory() as d:
+        dp = Path(d)
+        (dp / "spec.md").write_text("spec", encoding="utf-8")
+        (dp / "review.md").write_text("review", encoding="utf-8")
+        task = {"id": tid, "repo": str(dp / "repo"), "base_branch": "main", "branch": "feat/x", "worktree": str(dp / "wt"),
+                "spec_file": str(dp / "spec.md"), "verify": [{"name": "v", "cmd": "echo hi"}],
+                "review": {"policy": "always", "instructions_file": str(dp / "review.md")}}
+        (dp / "task.json").write_text(json.dumps(task), encoding="utf-8")
+        held = relay.runlock.try_hold(relay.task_lock_path(tid))  # 模擬同任務正在真跑
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = relay.main([str(dp / "task.json"), "--dry-run"])
+            real, dry = relay.HERE / "runs" / tid, relay.HERE / "runs" / (tid + ".dry")
+            check("dry-run 寫到 runs/<id>.dry/、不建 runs/<id>/", rc == 0 and (dry / "STATE.json").is_file() and not real.exists(),
+                  f"rc={rc} dry={dry.exists()} real={real.exists()}")
+            check("dry-run 不取任何鎖：同任務鎖被持有時照跑", rc == 0, f"rc={rc}")
+        finally:
+            held.release()
+            rm_runs(tid)
+
+
+def test_runlock() -> None:
+    """C3（2026-10-05）：tools/runlock.py。Windows byte-range lock 與 POSIX flock 都是 per-handle，可同行程測。"""
+    from tools import runlock
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        p = Path(d) / "sub" / "x.lock"
+        h1, h2 = runlock.try_hold(p), runlock.try_hold(p)
+        check("try_hold：第一個 handle 拿到（含建上層目錄）", h1 is not None)
+        check("try_hold：第二個 handle 拿不到 → None", h2 is None)
+        check("is_held：持有中 → True", runlock.is_held(p))
+        t0 = time.monotonic()
+        try:
+            with runlock.locked(p, timeout=0.3):
+                busy = False
+        except runlock.LockBusy:
+            busy = True
+        el = time.monotonic() - t0
+        check("locked(timeout=0.3)：別人持有 → LockBusy，耗時 ≥0.3s", busy and el >= 0.3, f"busy={busy} el={el:.3f}")
+        h1.release()
+        h1.release()  # 可重複呼叫
+        h3 = runlock.try_hold(p)
+        check("release（重複呼叫也無害）後再 try_hold → 拿到", h3 is not None)
+        if h3:
+            h3.release()
+        check("is_held：釋放後 → False", not runlock.is_held(p))
+        nope = Path(d) / "nope.lock"
+        check("is_held：鎖檔不存在 → False，且不替呼叫端建檔", not runlock.is_held(nope) and not nope.exists())
+
+
+def test_parallel() -> None:
+    """C3（2026-10-05）：帳本多行程併寫、acquire_run_locks 三種擋法與 --queue、並行上限、task id、agy 不退回 --continue。"""
+    import subprocess
+    from tools import agy_review, runlock
+
+    # 4. 多行程帳本（1 項）：4 個子行程各 append 200 行，全部要是完整的 JSON 行
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        ledger = Path(d) / "ledger.jsonl"
+        script = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\nimport relay\n"
+                  "relay.LOCKS = Path(sys.argv[2])\n"
+                  "for i in range(200):\n    relay.ledger_append({'task': 't', 'who': sys.argv[3], 'i': i, 'pad': 'x' * 300})\n")
+        env = dict(os.environ, RELAY_LEDGER=str(ledger), PYTHONUTF8="1")
+        procs = [subprocess.Popen([sys.executable, "-c", script, str(relay.HERE), str(Path(d) / "locks"), str(k)], env=env)
+                 for k in range(4)]
+        codes = [p.wait(timeout=180) for p in procs]
+        keys, bad = set(), 0
+        for line in ledger.read_text(encoding="utf-8").splitlines() if ledger.exists() else []:
+            try:
+                e = json.loads(line)
+                keys.add((e["who"], e["i"]))
+            except (json.JSONDecodeError, KeyError):
+                bad += 1
+        check("帳本：4 行程 × 200 行併寫（RELAY_LEDGER 指暫存）→ 800 行全部可 json.loads、無重疊",
+              codes == [0, 0, 0, 0] and len(keys) == 800 and bad == 0, f"codes={codes} keys={len(keys)} bad={bad}")
+
+    env_bak, poll_bak = os.environ.get("RELAY_MAX_PARALLEL"), relay.QUEUE_POLL_SECONDS
+    stacks = contextlib.ExitStack()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            wt = {k: str(Path(d) / f"wt-{k}") for k in "abcq"}
+
+            def busy_msg(task: dict) -> str:
+                try:
+                    relay.acquire_run_locks(task, queue=False).close()
+                    return "（沒擋下）"
+                except runlock.LockBusy as exc:
+                    return str(exc)
+
+            # 5. acquire_run_locks（3 項＋被擋下不殘留鎖＋queue）
+            os.environ["RELAY_MAX_PARALLEL"] = "1"
+            s1 = stacks.enter_context(relay.acquire_run_locks({"id": "_t_a", "worktree": wt["a"]}, queue=False))
+            m = busy_msg({"id": "_t_b", "worktree": wt["b"]})
+            check("RELAY_MAX_PARALLEL=1：第二個不同任務、未加 queue → LockBusy 含「並行上限」", "並行上限" in m, m)
+            m = busy_msg({"id": "_t_a", "worktree": wt["b"]})
+            check("同 task id → LockBusy 含「正在跑」", "正在跑" in m, m)
+            m = busy_msg({"id": "_t_c", "worktree": wt["a"]})
+            check("不同 task、同 worktree → LockBusy 含「worktree」", "worktree" in m, m)
+            check("被擋下的那次不殘留鎖（_t_b 的任務鎖、worktree 鎖都已放掉）",
+                  not runlock.is_held(relay.task_lock_path("_t_b")) and not runlock.is_held(relay.worktree_lock_path(wt["b"])))
+            relay.QUEUE_POLL_SECONDS = 0.05
+            waited, got = threading.Event(), {}
+
+            def worker() -> None:
+                try:
+                    got["stack"] = relay.acquire_run_locks({"id": "_t_q", "worktree": wt["q"]}, queue=True, on_wait=waited.set)
+                except BaseException as exc:  # noqa: BLE001 — 失敗要帶回主執行緒顯示
+                    got["err"] = exc
+
+            th = threading.Thread(target=worker, daemon=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                th.start()
+                saw_wait = waited.wait(5)
+                still_waiting = "stack" not in got
+                s1.close()
+                th.join(5)
+            if "stack" in got:
+                stacks.enter_context(got["stack"])
+            check("--queue：名額滿 → 先 on_wait() 排隊、不拿名額；名額釋放後拿到",
+                  saw_wait and still_waiting and "stack" in got, str(got))
+            stacks.close()
+            # 6. 並行上限（2 項＋設 2 時兩個都拿得到）
+            with contextlib.redirect_stderr(io.StringIO()):
+                os.environ["RELAY_MAX_PARALLEL"] = "9"
+                n9 = relay.max_parallel()
+                os.environ["RELAY_MAX_PARALLEL"] = "abc"
+                nabc = relay.max_parallel()
+            check("RELAY_MAX_PARALLEL=9 → 實際名額 3", n9 == 3, str(n9))
+            check("RELAY_MAX_PARALLEL=abc → 1", nabc == 1, str(nabc))
+            os.environ["RELAY_MAX_PARALLEL"] = "2"
+            try:
+                stacks.enter_context(relay.acquire_run_locks({"id": "_t_a", "worktree": wt["a"]}, queue=False))
+                stacks.enter_context(relay.acquire_run_locks({"id": "_t_b", "worktree": wt["b"]}, queue=False))
+                both = True
+            except runlock.LockBusy as exc:
+                both = str(exc)
+            check("RELAY_MAX_PARALLEL=2：兩個不同任務都拿得到", both is True, str(both))
+            stacks.close()
+    finally:
+        stacks.close()
+        relay.QUEUE_POLL_SECONDS = poll_bak
+        if env_bak is None:
+            os.environ.pop("RELAY_MAX_PARALLEL", None)
+        else:
+            os.environ["RELAY_MAX_PARALLEL"] = env_bak
+
+    # 7. task id 驗證（2 項）
+    rcs = []
+    with tempfile.TemporaryDirectory() as d:
+        for tid in ("../x", "..", "a/b"):
+            tf = Path(d) / "t.json"
+            tf.write_text(json.dumps({"id": tid, "repo": d, "base_branch": "main", "branch": "b", "worktree": str(Path(d) / "wt"),
+                                      "spec_file": "s.md", "verify": [], "review": {"instructions_file": "r.md"}}), encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rcs.append(relay.main([str(tf), "--dry-run"]))
+    check("task id 驗證：'../x'、'..'、'a/b' → main 回 3、沒在 runs/ 外建目錄",
+          rcs == [3, 3, 3] and not (relay.HERE / "x.dry").exists() and not (relay.HERE / "runs" / "a").exists(), str(rcs))
+    v = relay.valid_task_id
+    check("task id 驗證：'gw-x.c1'、'_tmp' 通過；結尾 '.'／'.dry' 不通過",
+          v("gw-x.c1") and v("_tmp") and not v("a.") and not v("a.dry") and not v(""))
+
+    # 8. agy_review 第 1 塊沒有 conversation_id（1 項）
+    calls: list = []
+
+    def fake_agy(prompt, conv, timeout):
+        calls.append(conv)
+        return {"status": "SUCCESS", "response": "OK 1"}, "", 0
+
+    orig = agy_review.run_agy
+    with tempfile.TemporaryDirectory() as d:
+        instr, diff, out = (Path(d) / n for n in ("i.txt", "d.txt", "o.json"))
+        instr.write_text("核對", encoding="utf-8")
+        diff.write_text("+x = 1\n", encoding="utf-8")
+        try:
+            agy_review.run_agy = fake_agy
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = agy_review.main(["--instructions", str(instr), "--diff", str(diff), "--out", str(out)])
+        finally:
+            agy_review.run_agy = orig
+    check("agy_review：第 1 塊沒回 conversation_id → 回 1，且沒用 __continue__ 再呼叫", rc == 1 and calls == [None],
+          f"rc={rc} calls={calls}")
+
+
+def main() -> int:
+    # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
+    orig_locks = relay.LOCKS
+    locks_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    relay.LOCKS = Path(locks_tmp.name) / "locks"
+    try:
+        for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
+                   test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel):
+            print(f"--- {fn.__name__} ---")
+            try:
+                fn()
+            except Exception as exc:  # 改前（函式還不存在）要紅得有名字，不要整支崩潰
+                FAILED.append(f"{fn.__name__} 例外：{exc!r}")
+                print(f"[FAIL] {fn.__name__} 例外：{exc!r}")
+    finally:
+        relay.LOCKS = orig_locks
+        locks_tmp.cleanup()
     print(f"\n{PASSED} passed / {len(FAILED)} failed")
     for n in FAILED:
         print("  ✗", n)

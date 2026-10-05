@@ -16,12 +16,16 @@
 
 用法：
   PYTHONUTF8=1 python relay.py tasks/<task>.json            # 跑一棒
-  PYTHONUTF8=1 python relay.py tasks/<task>.json --dry-run  # 只印計畫不呼叫任何 CLI
-離開碼：0＝收斂並已 commit；2＝不收斂／被擋，已寫 HANDOFF 給人；3＝參數／環境錯。
+  PYTHONUTF8=1 python relay.py tasks/<task>.json --dry-run  # 只印計畫不呼叫任何 CLI（紀錄寫到 runs/<id>.dry/）
+  PYTHONUTF8=1 python relay.py tasks/<task>.json --queue    # 並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊
+  PYTHONUTF8=1 python relay.py --status [--all]             # 所有棒的階段、輪次、耗時、是否等人
+離開碼：0＝收斂並已 commit；2＝不收斂／被擋，已寫 HANDOFF 給人；3＝參數／環境錯、被鎖擋下拒跑、或例外中止
+（STATE 記 aborted）；130＝Ctrl-C。
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,20 +33,37 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import unicodedata
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
-from tools import iface_gate, inject_check, paths  # noqa: E402
+from tools import iface_gate, inject_check, paths, runlock  # noqa: E402
 
 # 2026-10-05：verify 與陰性對照共用同一個逾時預設。原本陰性對照寫死 300、verify 是 1800，
 # 沒寫 timeout 的慢測試 verify 綠、陰性對照卻逾時，被誤判成「新斷言沒抓到違規」而退回實作者。
 VERIFY_TIMEOUT_DEFAULT = 1800
 # 2026-10-05：「新增但不算改動」的未追蹤路徑前綴預設值，changed_paths 與送審判準兩處共用。
 IGNORE_NEW_DEFAULT = ["_refactor/", "views/", "__pycache__"]
-LEDGER = HERE / "runs" / "usage_ledger.jsonl"  # P4：跨任務用量帳本（只記帳，不換手）
+# P4：跨任務用量帳本（只記帳，不換手）。2026-10-05：可由 RELAY_LEDGER 覆寫（多行程併寫測試用），預設不變。
+LEDGER = Path(os.environ.get("RELAY_LEDGER") or HERE / "runs" / "usage_ledger.jsonl")
+
+# ---- C3（2026-10-05）：並行鎖。鎖檔都在 runs/.locks/（runs/ 已 gitignore），語意見 tools/runlock.py。
+# 鎖只在同一份 relay 安裝目錄內有效（每份安裝各有自己的 runs/）。
+LOCKS = HERE / "runs" / ".locks"
+MAX_PARALLEL_HARD = 3     # RELAY_MAX_PARALLEL 硬上限：再多＝同時燒更多份訂閱額度，且 agy／Codex 本機狀態並行未實測
+REPO_LOCK_TIMEOUT = 600   # 同 repo 的 worktree add／commit 互斥；別棒的 commit 正常是秒級，等 10 分鐘還拿不到就大聲停
+QUEUE_POLL_SECONDS = 30   # --queue 時重試並行名額的間隔
+TASK_LOCK_GRACE = 0.5     # 取任務鎖時多等的秒數：吸收 --status 判活「拿一下立刻放」的瞬間（見 runlock.is_held）
+TASK_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,99}")
+# ---- C1（2026-10-05）：--status 總表
+STATUS_LIMIT = 15
+TERMINAL_PHASES = ("done", "escalate", "aborted")
 
 # 三個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
 PY = paths.resolve_python()
@@ -106,8 +127,10 @@ def parse_review(text: str) -> dict:
 
 def ledger_append(entry: dict) -> None:
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    with open(LEDGER, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # 2026-10-05（C3）：並行時兩個行程會同時 append；Windows 的 append 是「先 seek 到尾再寫」非原子，會交錯／覆寫
+    with runlock.locked(LOCKS / "ledger.lock"):
+        with open(LEDGER, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def ledger_totals() -> dict:
@@ -160,6 +183,12 @@ class State:
     iface_gate: dict = field(default_factory=dict)
     started: str = ""
     updated: str = ""
+    # 2026-10-05（C1）：--status 要用的欄位；都有預設值，舊 STATE 讀得進來
+    title: str = ""
+    task_file: str = ""       # 絕對路徑
+    max_rounds: int = 0       # 0＝舊 STATE（總表顯示 round/?）
+    pid: int = 0              # 只供人看；判活一律看任務鎖（見 tools/runlock.py）
+    abort_reason: str = ""
 
 
 def now() -> str:
@@ -286,13 +315,116 @@ def parse_porcelain_z(out: str) -> list[tuple[str, str]]:
     return res
 
 
+# ---- C3（2026-10-05）：不同任務並行——加鎖＋全域並行上限 -------------------------------------
+def _path_key(p: str) -> str:
+    """路徑 → 12 碼雜湊；normcase＋abspath 讓 Windows 上大小寫／斜線方向不同的同一路徑拿到同一把鎖。"""
+    return hashlib.sha1(os.path.normcase(os.path.abspath(p)).encode("utf-8")).hexdigest()[:12]
+
+
+def task_lock_path(task_id: str) -> Path:
+    return LOCKS / f"task-{task_id}.lock"
+
+
+def worktree_lock_path(worktree: str) -> Path:
+    return LOCKS / f"wt-{_path_key(worktree)}.lock"
+
+
+def repo_lock_path(repo: str) -> Path:
+    return LOCKS / f"repo-{_path_key(repo)}.lock"
+
+
+def valid_task_id(tid) -> bool:
+    """task id 直接拼進 runs/<id>/ 與鎖檔名（信任邊界輸入）：以前 `..\\x` 這種 id 會寫到 runs/ 外。
+    另擋結尾 `.`（Windows 會吃掉結尾的點：`a.` 與 `a` 落在同一目錄、卻是兩把不同的任務鎖）
+    與結尾 `.dry`（和 dry-run 目錄撞名，--status 也會把它當 dry-run 略過）。"""
+    return isinstance(tid, str) and TASK_ID_RE.fullmatch(tid) is not None and not tid.endswith((".", ".dry"))
+
+
+def max_parallel() -> int:
+    """RELAY_MAX_PARALLEL → 實際名額，夾在 [1, MAX_PARALLEL_HARD]；預設 1＝一次一棒（決策 D4）。
+    值不合法不靜默：印警告後當 1／夾到上限。"""
+    raw = os.environ.get("RELAY_MAX_PARALLEL", "1")
+    try:
+        n = int(raw)
+    except ValueError:
+        print(f"⚠ RELAY_MAX_PARALLEL={raw!r} 不是整數，當成 1", file=sys.stderr)
+        return 1
+    clamped = min(max(n, 1), MAX_PARALLEL_HARD)
+    if clamped != n:
+        print(f"⚠ RELAY_MAX_PARALLEL={n} 超出 1～{MAX_PARALLEL_HARD}，當成 {clamped}", file=sys.stderr)
+    return clamped
+
+
+def _take_slot(n: int) -> runlock.Held | None:
+    for i in range(n):
+        h = runlock.try_hold(LOCKS / f"slot-{i}.lock")
+        if h is not None:
+            return h
+    return None
+
+
+def acquire_run_locks(task: dict, *, queue: bool, take_slot: bool = True, on_wait=None) -> ExitStack:
+    """取一棒要整棒持有的鎖，回 ExitStack（with 結束或例外時全部釋放；行程被硬殺則由 OS 釋放）。
+
+    順序固定 任務 → worktree → 名額：所有行程同序取鎖，不會死結。任務鎖同時是 --status 判活的依據。
+    名額全滿：沒加 queue → LockBusy；有 queue → 先呼叫 on_wait()（main 用來把 STATE 記成 queued），
+    之後每 QUEUE_POLL_SECONDS 秒重試，不設逾時（人可 Ctrl-C）。
+    ponytail：排隊不保證先來先跑（誰先輪詢到誰拿）；名額上限 3、人工啟動的量下不值得做票號。
+    升級路徑：runs/.locks/ 下依時間戳排序的票號檔，只有排第一的才去搶名額。"""
+    stack = ExitStack()
+    try:
+        h = runlock.wait_hold(task_lock_path(task["id"]), TASK_LOCK_GRACE)
+        if h is None:
+            raise runlock.LockBusy(f"任務 {task['id']} 正在跑或排隊（relay.py --status）")
+        stack.callback(h.release)
+        h = runlock.try_hold(worktree_lock_path(task["worktree"]))
+        if h is None:
+            raise runlock.LockBusy(f"worktree {task['worktree']} 正被另一個任務使用")
+        stack.callback(h.release)
+        if take_slot:
+            n, waited, last_note = max_parallel(), False, None
+            while True:
+                h = _take_slot(n)
+                if h is not None:
+                    stack.callback(h.release)
+                    if waited:
+                        emit("RELAY", f"拿到並行名額（{h.path.name}），開跑")
+                    break
+                if not queue:
+                    raise runlock.LockBusy(f"並行上限 {n} 已滿（RELAY_MAX_PARALLEL）；要排隊加 --queue")
+                if not waited:
+                    waited = True
+                    if on_wait:
+                        on_wait()
+                if last_note is None or time.monotonic() - last_note >= 600:
+                    emit("RELAY", f"等待並行名額…（上限 {n}＝RELAY_MAX_PARALLEL；每 {QUEUE_POLL_SECONDS} 秒重試，Ctrl-C 放棄）")
+                    last_note = time.monotonic()
+                time.sleep(QUEUE_POLL_SECONDS)
+    except BaseException:
+        stack.close()
+        raise
+    return stack
+
+
+def _read_state(path: Path) -> dict | None:
+    """讀一份 STATE.json；不存在、讀不到、不是 JSON 物件都回 None。"""
+    try:
+        s = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return s if isinstance(s, dict) else None
+
+
 class Run:
-    def __init__(self, task: dict, dry: bool):
+    def __init__(self, task: dict, dry: bool, *, task_file: str = ""):
         self.t = task
         self.dry = dry
-        self.dir = HERE / "runs" / task["id"]
+        # 2026-10-05（C1）：dry-run 寫到 runs/<id>.dry/，不再覆蓋已跑過任務的真實紀錄（--status 略過 *.dry）
+        self.dir = HERE / "runs" / (task["id"] + (".dry" if dry else ""))
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.state = State(task_id=task["id"], started=now())
+        self.prev_state = _read_state(self.dir / "STATE.json")  # 上一次留下的 STATE：認出「前次沒收尾」用
+        self.state = State(task_id=task["id"], started=now(), title=task.get("title", ""), task_file=task_file,
+                           max_rounds=int(task.get("max_rounds", 2)), pid=os.getpid())
         self.wt = task["worktree"]
         self.repo = task["repo"]
 
@@ -317,6 +449,22 @@ class Run:
     def log(self, msg: str, prefix: str = "RELAY") -> None:
         emit(prefix, msg, self.dir / "relay.log")
 
+    def abort(self, reason: str, notify: bool = True) -> None:
+        """例外中止也要落檔（2026-10-05，C1）：以前 RuntimeError 由 main() 接住後不寫 STATE，階段停在中止前
+        那格（例如 review），--status 看起來像還在跑。notify 參數留給棒 A3 接推播，本棒未使用。"""
+        self.state.abort_reason = reason[:500]
+        self.save("aborted")
+        self.write_current(f"# CURRENT\n\n任務 {self.t['id']} 中止：{reason[:500]}；看 relay.log。\n")
+        self.log(f"任務中止：{reason[:500]}")
+
+    def note_interrupted_previous(self) -> None:
+        """拿到任務鎖之後呼叫（2026-10-05，C3）：上一次的 STATE 停在非終態＝那個行程沒收尾就不在了
+        （被硬殺、關機…）。OS 已釋放它的鎖、這裡拿得到就是證明；只負責把「認出殘留」記下來，本次照常從頭跑。"""
+        p = self.prev_state
+        if p and p.get("phase") not in TERMINAL_PHASES:
+            self.log(f"前一次行程（pid {p.get('pid') or '?'}）停在「{p.get('phase')}」（{p.get('updated') or '?'}）沒有收尾；"
+                     "它的任務鎖已無人持有＝行程已不在，本次從頭重跑")
+
     # ---- 1. worktree ---------------------------------------------------------
     def prepare(self) -> None:
         t = self.t
@@ -328,10 +476,13 @@ class Run:
         if not Path(self.wt).exists():
             # -c core.autocrlf=false：checkout 成 LF、與 git blob 一致。在 core.autocrlf=true
             # 的機器上，worktree 會被轉成 CRLF，撞到以 LF 內容釘死的 SHA 類斷言（假紅）。
-            r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", "-b", t["branch"], self.wt, t["base_branch"], timeout=300)
-            if r.returncode != 0:
-                # 分支可能已存在：直接掛上
-                r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", self.wt, t["branch"], timeout=300)
+            # 2026-10-05（C3）：在 repo 鎖內做——同 repo 兩棒同時 worktree add 會撞 git 自己的 ref／index lock，
+            # 下面的 fallback 又會把那種錯誤誤當成「分支已存在」再試一次，最後以誤導的訊息中止。
+            with runlock.locked(repo_lock_path(self.repo), timeout=REPO_LOCK_TIMEOUT):
+                r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", "-b", t["branch"], self.wt, t["base_branch"], timeout=300)
+                if r.returncode != 0:
+                    # 分支可能已存在：直接掛上
+                    r = git(self.repo, "-c", "core.autocrlf=false", "worktree", "add", self.wt, t["branch"], timeout=300)
             if r.returncode != 0:
                 raise RuntimeError("worktree add 失敗：" + r.stderr[-400:])
             self.log(f"worktree 建立 {self.wt}（{t['branch']} ← {t['base_branch']}@{base}）")
@@ -517,15 +668,17 @@ class Run:
         if self.dry:
             self.log(f"[dry] commit {paths}")
             return "(dry)"
-        r = git(self.wt, "add", "--", *paths)
-        if r.returncode != 0:
-            raise RuntimeError("git add 失敗：" + r.stderr[-300:])
         msg_f = self.dir / "commit_msg.txt"
         msg_f.write_text(message, encoding="utf-8")
-        r = git(self.wt, "commit", "-q", "-F", str(msg_f))
-        if r.returncode != 0:
-            raise RuntimeError("git commit 失敗：" + r.stderr[-300:])
-        return git(self.wt, "rev-parse", "--short", "HEAD").stdout.strip()
+        # 2026-10-05（C3）：add／commit 在 repo 鎖內（同 repo 別棒的 worktree add／commit 會撞 git 的 lock 檔）
+        with runlock.locked(repo_lock_path(self.repo), timeout=REPO_LOCK_TIMEOUT):
+            r = git(self.wt, "add", "--", *paths)
+            if r.returncode != 0:
+                raise RuntimeError("git add 失敗：" + r.stderr[-300:])
+            r = git(self.wt, "commit", "-q", "-F", str(msg_f))
+            if r.returncode != 0:
+                raise RuntimeError("git commit 失敗：" + r.stderr[-300:])
+            return git(self.wt, "rev-parse", "--short", "HEAD").stdout.strip()
 
     # ---- HANDOFF -------------------------------------------------------------
     def handoff(self, status: str, impl_report: str, verify_summary: str, review_text: str, paths: list[str], blocker: str) -> None:
@@ -665,16 +818,125 @@ class Run:
         return 2
 
 
+# ---- C1（2026-10-05）：relay.py --status 狀態總表 ------------------------------------------------
+def collect_states(runs_dir: Path) -> list[dict]:
+    """掃 runs_dir/*/STATE.json（不遞迴；略過 *.dry 與 "_" 開頭的目錄）。JSON 壞時等 0.2 秒重讀一次，
+    仍壞回 {"task_id": 目錄名, "_bad": True}（寫入中被讀到的競態）。
+    ponytail：save() 不改成「寫暫存檔＋os.replace」——Windows 上讀取端開著檔時 os.replace 會 PermissionError，
+    反而可能讓 relay 本身崩潰；改由讀取端重讀一次容忍半寫狀態。已知上限：極少數時候某列顯示「讀取失敗」，再跑一次即可。"""
+    if not runs_dir.is_dir():
+        return []
+    out = []
+    for d in sorted(runs_dir.iterdir()):
+        f = d / "STATE.json"
+        if not d.is_dir() or d.name.endswith(".dry") or d.name.startswith("_") or not f.is_file():
+            continue
+        s = _read_state(f)
+        if s is None:
+            time.sleep(0.2)
+            s = _read_state(f)
+        out.append({**s, "task_id": s.get("task_id") or d.name} if s is not None else {"task_id": d.name, "_bad": True})
+    return out
+
+
+def _parse_ts(s) -> datetime | None:
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")  # now() 的格式，帶 +0800
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_minutes(seconds: float) -> str:
+    m = max(int(seconds // 60), 0)
+    return f"{m}分" if m < 60 else f"{m // 60}時{m % 60}分"
+
+
+def _waiting(s: dict, alive: bool) -> str:
+    """「等人？」欄，依序比對（README「跑」段有摘要）。活著只看鎖，不看 STATE 的階段說什麼。"""
+    phase, verdict = s.get("phase"), s.get("verdict")
+    if s.get("_bad"):
+        return "（STATE 讀取失敗）"
+    if alive:
+        return "排隊中" if phase == "queued" else "跑中"
+    if phase == "done":
+        return f"待合併 {s.get('commit') or '?'}"
+    if phase == "escalate":
+        if verdict == "review_tool_failure":
+            return "要人看（審查工具故障）"
+        if verdict in ("rate_limit", "reviewer_rate_limit"):
+            return "要人看（撞牆）"
+        return "要人看（未收斂）"
+    if phase == "aborted":
+        return f"要人看（中止：{(s.get('abort_reason') or '')[:20]}）"
+    return "中斷？（行程已不在）"
+
+
+def status_rows(states: list[dict], alive: dict[str, bool], now: datetime) -> list[dict]:
+    """STATE 清單 → 總表列，依 updated 由新到舊。alive[task_id]＝任務鎖有沒有人持有；now 要帶時區。
+    耗時：活著＝now − started；否則＝updated − started。"""
+    rows = []
+    for s in states:
+        tid, bad = s.get("task_id", "?"), bool(s.get("_bad"))
+        is_alive = bool(alive.get(tid))
+        started, updated = _parse_ts(s.get("started")), _parse_ts(s.get("updated"))
+        end = now if is_alive else updated
+        rows.append({
+            "task": tid,
+            "phase": "?" if bad else str(s.get("phase", "?")),
+            "round": "?" if bad else f"{s.get('round', 0)}/{s.get('max_rounds') or '?'}",
+            "elapsed": _fmt_minutes((end - started).total_seconds()) if started and end else "?",
+            "waiting": _waiting(s, is_alive),
+            "updated": updated.strftime("%m-%d %H:%M") if updated else "?",  # STATE 本來就是 +0800，直接顯示
+            "_ts": updated,
+        })
+    rows.sort(key=lambda r: r["_ts"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return rows
+
+
+_STATUS_COLS = (("task", "任務"), ("phase", "階段"), ("round", "輪次"), ("elapsed", "耗時"),
+                ("waiting", "等人？"), ("updated", "更新"))
+
+
+def _disp_width(s: str) -> int:
+    """終端機顯示寬度：East Asian Wide／Fullwidth 算 2，其餘 1（對齊中文欄用）。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def render_status(rows: list[dict], limit: int | None) -> str:
+    if not rows:
+        return "（沒有任何紀錄）"
+    shown = rows if limit is None else rows[:limit]
+    table = [[h for _, h in _STATUS_COLS]] + [[str(r[k]) for k, _ in _STATUS_COLS] for r in shown]
+    widths = [max(_disp_width(line[i]) for line in table) for i in range(len(_STATUS_COLS))]
+    lines = ["  ".join(c + " " * (w - _disp_width(c)) for c, w in zip(line, widths)).rstrip() for line in table]
+    if len(shown) < len(rows):
+        lines.append(f"（另有 {len(rows) - len(shown)} 筆較舊的紀錄；--all 看全部）")
+    return "\n".join(lines)
+
+
+def status_report(limit: int | None) -> str:
+    states = collect_states(HERE / "runs")
+    alive = {s["task_id"]: valid_task_id(s["task_id"]) and runlock.is_held(task_lock_path(s["task_id"]))
+             for s in states}
+    return render_status(status_rows(states, alive, datetime.now().astimezone()), limit)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("task", nargs="?")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--ledger", action="store_true", help="印出跨任務用量帳本總計")
+    ap.add_argument("--status", action="store_true", help=f"所有棒的階段、輪次、耗時、是否等人（預設最近 {STATUS_LIMIT} 筆）")
+    ap.add_argument("--all", action="store_true", help="配 --status：列出全部紀錄")
+    ap.add_argument("--queue", action="store_true", help="並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊等，不直接拒跑")
     a = ap.parse_args(argv)
     if a.ledger:
         for cli, t in ledger_totals().items():
             print(f"{cli:6s} calls={t['calls']} input_total={t['input_total']:,} output={t['output']:,} "
                   f"seconds={t['seconds']:.0f} rate_limited={t['rate_limited']}")
+        return 0
+    if a.status:
+        print(status_report(None if a.all else STATUS_LIMIT))
         return 0
     if not a.task:
         ap.error("缺 task 檔")
@@ -688,6 +950,10 @@ def main(argv=None) -> int:
         if k not in task:
             print(f"task 缺欄位 {k}", file=sys.stderr)
             return 3
+    if not valid_task_id(task["id"]):
+        print(f"task id 不合法：{task['id']!r}（英數或底線開頭，其後英數 . _ -，最長 100 字，不可以 . 或 .dry 結尾）",
+              file=sys.stderr)
+        return 3
     # 相對路徑一律相對於 relay.py 所在目錄
     for k in ("spec_file",):
         if not Path(task[k]).is_absolute():
@@ -698,11 +964,34 @@ def main(argv=None) -> int:
     if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
         print("worktree 不得等於生產目錄", file=sys.stderr)
         return 3
+    run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()))
+    # 2026-10-05（C3）：取鎖與跑棒分兩段——取鎖階段被擋時 runs/<id>/ 可能正被別的行程寫，不可寫 STATE；
+    # 跑棒階段的任何例外都在鎖還握著時落檔（C1：中止要寫進 STATE，總表才不會說謊）。dry-run 不取任何鎖。
     try:
-        return Run(task, a.dry_run).run()
-    except RuntimeError as e:
-        print("relay 中止：", e, file=sys.stderr)
+        locks = nullcontext() if a.dry_run else acquire_run_locks(task, queue=a.queue, on_wait=lambda: run.save("queued"))
+    except runlock.LockBusy as e:
+        print("relay 拒跑：", e, file=sys.stderr)
         return 3
+    except KeyboardInterrupt:
+        if run.state.phase == "queued":  # 排隊中按 Ctrl-C：queued 是自己寫的，改記中止，總表才不會顯示「中斷？」
+            run.abort("使用者中斷（排隊中）", notify=False)
+        return 130
+    with locks:
+        try:
+            if not a.dry_run:
+                run.note_interrupted_previous()
+            return run.run()
+        except KeyboardInterrupt:
+            run.abort("使用者中斷", notify=False)
+            return 130
+        except RuntimeError as e:  # relay 自己丟的中止：撞牆、worktree／prebuild 失敗、規格外改動、等 repo 鎖逾時…
+            print("relay 中止：", e, file=sys.stderr)
+            run.abort(str(e))
+            return 3
+        except Exception as e:  # 其他崩潰（git 逾時 TimeoutExpired 等）也要落檔，並留 traceback
+            run.abort(f"{type(e).__name__}: {e}")
+            traceback.print_exc()
+            return 3
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 為什麼要分塊：Windows 命令列上限約 32K 字元，`agy -p "<整包 diff>"` 超過就 exit 126 根本沒啟動；
 而本機實測 agy 無頭模式**不讀 stdin**（redirect 與 pipe 都回 NO_STDIN），又不能給檔案路徑
 （headless 讀檔工具會被軟拒 → status=SUCCESS 但 response 空）。`--conversation <id>` 能沿用同一個對話
-（id 取自第 1 塊的回傳；`--continue` 只當備援，理由見 run_agy），
+（id 取自第 1 塊的回傳；拿不到就失敗，不退回 `--continue`，理由見 run_agy），
 所以：第 1..N 輪各送一塊 diff 要它「只回 OK」，第 N+1 輪送審查指令。
 
 每一輪都用 -p 明說「不要使用任何工具」，避免它想跑指令被無頭模式自動拒絕後回空 response。
@@ -29,7 +29,7 @@ NO_TOOLS = "不要使用任何工具：不要執行指令、不要讀檔、不�
 
 
 def run_agy(prompt: str, conv: str | None, timeout: int) -> tuple[dict | None, str, int]:
-    """conv=None ⇒ 開新對話；conv="__continue__" ⇒ `--continue`（舊行為，備援）；其他 ⇒ `--conversation <id>`。
+    """conv=None ⇒ 開新對話；conv="__continue__" ⇒ `--continue`（只留給手動呼叫，main() 不再走）；其他 ⇒ `--conversation <id>`。
 
     2026-09-16 踩到：`--continue` 接的是「最近一個對話」，使用者同時在終端用 agy（登入／互動）時，
     第 2 塊起會接到別人的對話 ⇒ 審查者只看到最後一兩塊、前幾塊在別的對話裡，回「diff 缺 README／測試本體」
@@ -115,7 +115,13 @@ def main(argv=None) -> int:
             print("chunk 送入失敗；stderr：", err.strip()[:300], file=sys.stderr)
             return 1
         if i == 1:
-            conv_id = obj.get("conversation_id") or "__continue__"
+            conv_id = obj.get("conversation_id")
+            if not conv_id:
+                # 2026-10-05（C3）：不再退回 `--continue`——它接「最近一個對話」，並行時會接到另一棒的審查對話。
+                # 寧可當審查工具故障停下（relay 會大聲說），也不要在錯的對話裡審出假結果。
+                print("第 1 塊沒有回傳 conversation_id，無法把後續各塊釘在同一個對話；不退回 --continue，停止",
+                      file=sys.stderr)
+                return 1
             print(f"conversation={conv_id}")
     final = (f"{NO_TOOLS}\n以上 {len(parts)} 段就是完整 diff。現在請照下面的審查指令作答：\n\n{instr}")
     obj, err, rc = run_agy(final, conv=(conv_id if parts else None), timeout=a.timeout)
