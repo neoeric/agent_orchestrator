@@ -27,7 +27,8 @@
 在 Windows 11 上開發與實測，其他平台沒測過。
 
 **執行檔怎麼找**：`tools/paths.py` 的順序一律是 **環境變數 → PATH → 已知安裝位置 → 報錯**。
-換機器只要裝好並登入；路徑特殊就設 `RELAY_CODEX`、`RELAY_AGY`（或 `AGY_EXE`）、`RELAY_PYTHON`。
+換機器只要裝好並登入；路徑特殊就設 `RELAY_CODEX`、`RELAY_AGY`（或 `AGY_EXE`）、`RELAY_CLAUDE`、`RELAY_PYTHON`。
+Claude 在 Windows 上會**略過 npm 的 `.cmd` 薄殼改用原生 exe**（多行 prompt 經 cmd.exe 會被截斷／轉義，prompt 一律走 stdin）。
 relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 
 ## 快速開始
@@ -203,12 +204,13 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 | 工具 | 用途 |
 |---|---|
-| `paths.py` | 三支 CLI 的執行檔解析（env → PATH → 已知位置） |
+| `paths.py` | 四支執行檔（python／codex／agy／claude）的解析（env → PATH → 已知位置）；`claude_env()` 清掉巢狀呼叫要移除的環境變數 |
 | `closure_map.py` | 純 AST 依賴閉包圖：每個頂層 def 的閉包碰不碰 db／net／model／route |
 | `deps_of.py` | 指定函式用到的同模組常數與 from-import（搬函式前查「還要帶什麼」） |
 | `extract_defs.py` | 把頂層定義抽成新模組並在原檔原名 re-export；連緊貼的註解一起搬，保 CRLF |
 | `iface_gate.py` | 簽章閘門：公開介面的 breaking／additive 判定 |
 | `check_ps1_encoding.py` | .ps1 改動後 BOM 數不變、換行不混用、無控制字元、PSParser 0 錯 |
+| `../council.py` | 三方討論執行器（見下方「三方討論」） |
 | `agy_review.py` | agy 唯讀審查：diff 分塊餵進同一對話，用第 1 塊回傳的 conversation id 以 `--conversation <id>` 釘住（不用 `--continue`：它接「最近一個對話」，你同時在終端用 agy 或並行跑別棒會接錯；第 1 塊沒回 id 就 exit 1 停下）；命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒 |
 | `runlock.py` | 跨行程檔案鎖（任務／worktree／並行名額／repo／帳本）；Windows `msvcrt`、POSIX `flock`，行程死掉 OS 自動釋放 |
 
@@ -217,11 +219,62 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
 PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行，93 項
+PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
 `fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓），判定器契約測試靠它。
 **任一 CLI 升版後全部重抓一輪再跑一次測試**——欄位語意變了不會有人通知你，這組測試是唯一的紅燈。
 抓法與每份樣本的重點見 `fixtures/README.md`。
+
+## 三方討論（council.py）
+
+用途：**同一份簡報（brief）給 Codex／Claude／agy 各自獨立回答**，主持人整理後，第二輪再把各方意見交叉給所有人評審、收斂。
+跟 relay 的派工不同：這裡沒有實作者與審查者，三方都只回答、不改任何檔案。
+
+```text
+PYTHONUTF8=1 python council.py --dir C:/work/council-topic --round 1 --repo C:/code/myproject
+PYTHONUTF8=1 python council.py --dir C:/work/council-topic --round 2 --repo C:/code/myproject
+PYTHONUTF8=1 python council.py --dir C:/work/council-topic --round 2 --who agy   # 只補跑一方
+```
+
+**目錄慣例**（`--dir`）：`00_briefing.md`（簡報）、`instructions_r{N}.md`（第 N 輪指令，**必須存在**，不會默默用別輪的）；
+產出 `r{N}_{codex,claude,agy}.md`（統一 LF；失敗的一方不會動它舊的檔）；原始 stdout／stderr 與各方 prompt 落 `_raw/`。
+第 N>1 輪預設自動附上 `r{N-1}_*.md`（缺的那方明寫「該方本輪無回覆」）。
+
+| 參數 | 說明 |
+|---|---|
+| `--who codex,claude,agy` | 要跑哪幾方，預設三方平行；只給一方＝補跑，只覆寫該方的檔 |
+| `--repo PATH` | 受測 repo，**唯讀**參考；給了之後預設 `codex,claude` 有權讀 |
+| `--repo-access LIST` | 覆寫誰有 repo 權；**不可含 agy**（無頭模式讀不到檔）→ exit 2 |
+| `--brief` / `--extra FILE...` / `--no-prev` | 簡報檔名（相對 `--dir`）／依序附在最後的附加材料／不附上一輪 |
+| `--claude-model` / `--codex-model` / `--timeout` | 模型與逾時（預設 codex 1800／claude 1200／agy 900 秒） |
+| `--raw-dir` / `--dump` | 原始輸出目錄（預設 `<dir>/_raw`）／只寫出各方 prompt、不呼叫任何 CLI |
+| `--no-safe-mode` | claude 預設帶 `--safe-mode`（不載入使用者 hooks／plugins／CLAUDE.md）；它若影響輸出格式時的退路 |
+
+**怎麼保證唯讀**：codex 用 `-s read-only`；claude 只開 `Read,Glob,Grep` 三個工具（無 repo 權時 `--tools ""` 完全無工具），
+並用空的 MCP 設定；agy 無工具。prompt 一律走 stdin（命令列有 32K 上限）。agy 的 prompt 超過 28,000 字元才分塊，
+**超過 3 塊或第 1 塊沒拿到 conversation id 就直接失敗**，不退回 `--continue`。
+離開碼：0＝要求的每一方都有答案；1＝有任一方失敗（其他方的檔照寫）；2＝參數錯。用量記進 `runs/usage_ledger.jsonl`（`relay.py --ledger` 看得到）。
+
+**主持人流程要點**（四次實戰的心得）：
+
+- **先把自己的立場落檔，再發 brief**，以免被三方的回答錨定。
+- brief 只放**原始計數**，衍生比率讓各方自己算——brief 裡預先算好的數字，曾是事實錯誤的來源。
+- 第二輪用「**待裁決清單＋每條列誰投什麼**」收斂最有效（實戰 8/8 收斂）。
+- **程式設計類題目至少兩方要有 repo 唯讀權**，才抓得到 brief 裡的事實錯誤；**需要新數字的輪次一定要給 repo 權**。
+- agy 適合當**只看簡報的外行質疑者**：沒有 repo 權，正好檢驗簡報自己講不講得通。
+- 原始輸出可能含內部資訊：`--raw-dir` 若落在 git repo 內且沒被 ignore，council 會警告。
+
+第二輪指令範本（泛化）：
+
+```text
+這是第二輪。附上第一輪三方各自的意見。請逐條看下面「待裁決清單」，對每一條回答 同意／不同意／部分同意，
+各用一句話說明理由；若你在第一輪的立場改變了，明講改了什麼、為什麼。不要重述第一輪已經說過的內容。
+有爭議的事實，請直接核對 repo 檔案再回答（不要修改任何檔案）。
+待裁決清單：
+1. （議題一；列出各方第一輪的立場）
+2. （議題二）
+```
 
 ## 三支 CLI 的固定開銷
 
@@ -254,7 +307,7 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
   **判準必須「只看 diff 就能答」；實跑證據由 `verify[]` 供給，不向審查者要。**
   這條踩過三次（AST 閘門漏判／審查者依指令沒讀外部原始檔＝只驗 diff 內部自洽／規格要求了它做不到的事），
   共同結論是：**閘門檢查不到的地方，不能假設審查者會自己補。**
-- 在 Claude Code 對話裡巢狀呼叫 `claude -p`，要先 unset `CLAUDECODE` 等環境變數（`fixtures/README.md` 有完整清單）。
+- 在 Claude Code 對話裡巢狀呼叫 `claude -p`，要先清掉 `CLAUDECODE` 等環境變數——relay／council 已自動處理（`tools/paths.py: CLAUDE_NESTED_ENV`；完整清單與來源見 `fixtures/README.md`）。
 - **`tools/agy_review.py` 的分塊實務上限是 3 塊**（2026-09-16 踩到）：同一份 19 條指令，diff 48KB 切 3 塊審得好好的，
   diff 62KB 切 4 塊時 agy 最後那一問只回了塊確認「OK 3」（`len=4`），沒有審查內容、白跑 329 秒；
   同一份 diff 改 `--chunk 34000` 切 2 塊就正常（51 秒、19/19）。⇒ diff 超過 ~55KB 先調大 `--chunk`（單塊 ≤ ~35KB 實測可）
