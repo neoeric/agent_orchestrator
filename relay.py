@@ -4,7 +4,7 @@
 
 依「多 Agent 協作方案 v3」與 2026-09-07 目標 repo 重構六組的手動實跑固化而成。一棒＝：
   1. 從 base_branch 開隔離 worktree（生產目錄永遠不碰），跑 repo 級前置步驟（例如建 gitignore 的 views/）
-  2. 實作者（Codex）依「完全指定」的規格改碼；不 commit
+  2. 實作者（Codex 或 Claude Code，task 的 implementer）依「完全指定」的規格改碼；不 commit
   3. 驗證指令逐條在 worktree 跑，全部 exit 0 才算過（最終事實來源＝測試，不是 CLI 的自我回報）
   4. 審查者（Antigravity agy，唯讀、diff 分塊內嵌）看 diff，回「可合併／需修改」＋未申報問題
   5. 判定器（judge.py）核對每一次 CLI 呼叫真的正常結束；驗證或審查不過 → 把發現餵回實作者再來一輪
@@ -38,6 +38,7 @@ import threading
 import time
 import traceback
 import unicodedata
+from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import MISSING, dataclass, field, asdict
 from datetime import datetime, timezone
@@ -83,15 +84,33 @@ class RateLimitStop(RuntimeError):
         super().__init__(msg)
         self.cli = cli
 
-# 三個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
+
+class ProductionTouched(RuntimeError):
+    """C4a（2026-10-05）：實作者呼叫前後生產目錄的快照不同（紅線，決策 D13＝一律中止）。
+    是 RuntimeError：main() 既有的 except 會走 abort（落檔＋推播），exit 3。"""
+
+# 四個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
 PY = paths.resolve_python()
 CODEX = paths.resolve_codex() or "codex"
 AGY = paths.resolve_agy() or "agy"
+# 2026-10-05（C4a）：Claude 實作者。resolve_claude 會略過 npm 的 .cmd 薄殼改回原生 exe（多行 prompt 經 cmd.exe 會壞）；
+# 找不到時的 "claude" 只會出現在 dry-run 計畫裡——真跑前 main() 的環境自檢就會擋下
+CLAUDE = paths.resolve_claude() or "claude"
 AGY_REVIEW = HERE / "tools" / "agy_review.py"
 
-IMPL_RULES = """【守則，違反即整棒作廢】
+# ---- C4a（2026-10-05）：實作者可插拔 codex｜claude ------------------------------------------------
+IMPLEMENTERS = ("codex", "claude")
+IMPL_NAMES = {"codex": "Codex", "claude": "Claude Code"}   # 給人看的名字（log、commit 訊息）
+# Claude 沒有 Codex 的沙箱，所以紅線改成「結構上做不到」：只給讀寫檔工具。沒有 Bash ⇒ 不能 git commit／push、
+# 不能啟動服務、也不能自己跑驗證指令（那本來就是 relay 的事）
+CLAUDE_IMPL_TOOLS = "Read,Edit,Write,Glob,Grep"
+# --effort 的合法值，來源：claude --help（2.1.246）。task 寫錯在啟動時就擋，不要等 CLI 回錯再白燒一輪
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# 2026-10-05（C4a）：本機路徑改成執行時的 {HERE}（原本寫死開發機路徑＝PUBLIC repo 洩漏、也不可攜）
+IMPL_RULES = f"""【守則，違反即整棒作廢】
 - 你在隔離 worktree 裡工作；生產目錄與其他任何目錄絕對不要碰。不要 git commit、不要 push、不要啟動任何服務、
-  **規格列的驗證指令由 relay 執行、不是你**——你的沙箱裡常沒有可用的 Python 3（裸 python 多是 2.7、專案 Python 3 可能被沙箱擋），硬跑只會浪費大量時間且完全不影響判定；你只要改好碼、做唯讀 diff 稽核、回報，不要自己跑那些驗證指令，也不要跑會載入模型的測試。不要修改 D:\\Tooling\\agent_orchestrator 底下任何檔案。
+  **規格列的驗證指令由 relay 執行、不是你**——你的環境裡常沒有可用的 Python 3（Claude 實作者根本沒有指令工具；Codex 沙箱裡裸 python 多是 2.7、專案 Python 3 可能被沙箱擋），硬跑只會浪費大量時間且完全不影響判定；你只要改好碼、做唯讀 diff 稽核、回報，不要自己跑那些驗證指令，也不要跑會載入模型的測試。不要修改 {HERE} 底下任何檔案。
 - 只做規格寫的事，不順手擴張；規格沒寫的檔案不要動。
 - 做完用「六欄交接簿」回報：1.完成了什麼 2.改了哪些檔（各幾行） 3.測試結果（指令＋通過數／總數，分「本次新增／既有紅燈／未跑」）
   4.有沒有動到公開介面（函式簽章、路由；有就列簽章） 5.目前卡點 6.建議下一步。
@@ -212,6 +231,7 @@ class State:
     last_feedback: str = ""   # 最後一輪組好、尚未解決的發現（收斂時清空）；resume 時附給實作者當參考
     resumed: list = field(default_factory=list)   # 每次 resume 一筆 {"ts","from_round","first_round","rounds","notes_sha256",…}
     commits: list = field(default_factory=list)   # relay 在這個 branch 上疊過的每一顆 commit；commit 欄＝最新一顆
+    implementer: str = ""     # C4a（2026-10-05）：最近一次實作者呼叫用的 CLI（codex／claude）；舊 STATE 沒有＝""
 
 
 def state_from_dict(d) -> State:
@@ -255,7 +275,7 @@ def sh(cmd: list[str], cwd: str | None = None, timeout: int = 900, env: dict | N
 
 # ---- 即時串流：讓 VS Code 整合終端機看得到三個角色在協力 --------------------------------
 _ESC = chr(27)
-_COLORS = {"RELAY": "90", "CODEX": "36", "AGY": "35", "JUDGE": "33", "VERIFY": "32", "HUMAN": "93"}
+_COLORS = {"RELAY": "90", "CODEX": "36", "CLAUDE": "34", "AGY": "35", "JUDGE": "33", "VERIFY": "32", "HUMAN": "93"}
 _USE_COLOR = os.environ.get("NO_COLOR") is None
 
 
@@ -268,17 +288,40 @@ def emit(prefix: str, msg: str, logf=None) -> None:
             f.write(f"[{time.strftime('%H:%M:%S')}] {tag} {msg}\n")
 
 
-def stream(cmd, prefix: str, on_line, cwd=None, timeout=900, env=None, logf=None, shell=False):
+def stream(cmd, prefix: str, on_line, cwd=None, timeout=900, env=None, logf=None, shell=False,
+           input_text: str | None = None, drop_env: tuple = ()):
     """跑子行程並逐行即時印帶前綴的行（給 VS Code 終端機看），同時完整收集 stdout／stderr 回傳給判定器。
-    on_line(rawline)->str|None：回字串就印（已翻成人看得懂），回 None 就吞掉（雜訊）。"""
+    on_line(rawline)->str|None：回字串就印（已翻成人看得懂），回 None 就吞掉（雜訊）。
+
+    2026-10-05（C4a）：input_text 非 None 時經 stdin 送給子行程（prompt 不再走 argv，不受 Windows 32K 命令列上限）；
+    drop_env 是建好 env 後要刪的鍵（巢狀呼叫 claude 要清掉 paths.CLAUDE_NESTED_ENV）。"""
     e = dict(os.environ, PYTHONUTF8="1", GIT_TERMINAL_PROMPT="0")
     if env:
         e.update(env)
+    for k in drop_env:
+        e.pop(k, None)
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         encoding="utf-8", errors="replace", env=e, stdin=subprocess.DEVNULL, bufsize=1, shell=shell)
+                         encoding="utf-8", errors="replace", env=e, bufsize=1, shell=shell,
+                         stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE)
     out, err = [], []
     et = threading.Thread(target=lambda: [err.append(x) for x in iter(p.stderr.readline, "")], daemon=True)
     et.start()
+    feeder = None
+    if input_text is not None:
+        def feed() -> None:
+            # 另開 thread 寫：大 prompt 塞滿 pipe 時寫入會阻塞，主執行緒要同時讀 stdout，否則雙方互卡。
+            # 寫 bytes 到底層 buffer：text 模式在 Windows 會把 \n 轉成 \r\n，偷偷改了 prompt（council.py 同一個坑）。
+            try:
+                p.stdin.buffer.write(input_text.encode("utf-8"))
+            except OSError:  # 含 BrokenPipeError：子行程提早退出（例如認證失敗），判定器會從 stdout 判失敗
+                pass
+            finally:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
     killed = {"v": False}
     timer = threading.Timer(timeout, lambda: (killed.__setitem__("v", True), p.kill()))
     timer.start()
@@ -292,6 +335,8 @@ def stream(cmd, prefix: str, on_line, cwd=None, timeout=900, env=None, logf=None
         timer.cancel()
     p.wait()
     et.join(timeout=5)
+    if feeder is not None:
+        feeder.join(timeout=5)
     r = subprocess.CompletedProcess(cmd, p.returncode if not killed["v"] else 124, "".join(out), "".join(err))
     return r
 
@@ -325,6 +370,78 @@ def _codex_line(line: str):
     if t == "turn.failed":
         return "✗ turn.failed"
     return None
+
+
+_CLAUDE_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def _claude_line(line: str):
+    """C4a（2026-10-05）：`claude -p --output-format stream-json --verbose` 的一行 → 給人看的一行，其餘回 None。
+    事件形狀以 fixtures/claude_stream_ok.stdout.txt（2.1.246 真樣本）為準：system/init、assistant、rate_limit_event、result。"""
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        e = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(e, dict):
+        return None
+    t = e.get("type")
+    if t == "assistant":
+        content = (e.get("message") or {}).get("content")
+        shown = []
+        for b in content if isinstance(content, list) else []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                tx = (b.get("text") or "").strip().replace("\n", " ")
+                if tx:
+                    shown.append("💬 " + tx[:100])
+            elif b.get("type") == "tool_use":
+                name, inp = str(b.get("name") or "?"), b.get("input") if isinstance(b.get("input"), dict) else {}
+                target = str(inp.get("file_path") or inp.get("path") or inp.get("pattern") or "")
+                target = os.path.basename(target.rstrip("/\\")) or target
+                shown.append(f"{'✏' if name in _CLAUDE_EDIT_TOOLS else '$'} {name} {target}".rstrip())
+        return " ｜ ".join(shown) or None
+    if t == "result":
+        u = judge._claude_usage(e) or {}
+        head = "✗ 失敗" if e.get("is_error") is not False else "✓ 完成"
+        return f"{head} in={u.get('input_tokens_total')} out={u.get('output_tokens')}"
+    return None
+
+
+@dataclass
+class ImplCmd:
+    """實作者一次呼叫要的東西（C4a，2026-10-05）。prompt 不在 argv 裡：一律由 stream(input_text=…) 走 stdin。"""
+    argv: list[str]
+    prefix: str                              # 終端機前綴（_COLORS 的鍵）
+    line_fn: Callable[[str], str | None]     # stdout 一行 → 給人看的一行
+    drop_env: tuple[str, ...] = ()           # 子行程 env 要刪的鍵
+
+
+def build_impl_command(cli: str, wt: str, out_last, model: str | None = None, effort: str | None = None) -> ImplCmd:
+    """組實作者的指令（純函式，不呼叫任何東西）。cli 只能是 IMPLEMENTERS 之一；codex 不支援 effort（傳了就大聲錯）。"""
+    if cli == "codex":
+        if effort:
+            raise ValueError("codex 實作者不支援 effort（implementer_effort 只接受 claude）")
+        # 🔴 -o 一定要絕對路徑：相對路徑會以 -C（worktree）為基準，輸出檔會落進受測 repo（council.py 同一個坑）
+        argv = [CODEX, "exec", "--json", "-s", "workspace-write", "-C", str(wt), "-o", str(Path(out_last).resolve())]
+        argv += ["-m", model] if model else []
+        return ImplCmd(argv + ["-"], "CODEX", _codex_line)  # "-"＝prompt 從 stdin 讀（codex exec --help，0.160.0）
+    if cli == "claude":
+        argv = [CLAUDE, "-p", "--output-format", "stream-json", "--verbose",
+                "--permission-mode", "acceptEdits",      # 只自動接受檔案編輯；工作目錄外的寫入另由生產目錄守門兜底
+                "--tools", CLAUDE_IMPL_TOOLS,             # 硬限制可用工具：沒有 Bash（理由見 CLAUDE_IMPL_TOOLS）
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',  # 不載入任何 MCP（使用者環境有可寫 GitHub 的 MCP）
+                "--no-session-persistence",
+                # 決策 D12：不跑使用者 hooks／CLAUDE.md／使用者 skills（無頭子行程裡行為不可預期）。
+                # 2026-10-05 fixture 證實加了它 stream-json 照常（fixtures/claude_stream_ok.*），不需退回不加
+                "--safe-mode"]
+        argv += ["--model", model] if model else []
+        argv += ["--effort", effort] if effort else []
+        return ImplCmd(argv, "CLAUDE", _claude_line, paths.CLAUDE_NESTED_ENV)
+    raise ValueError(f"未知的實作者 {cli!r}（只能是 {' / '.join(IMPLEMENTERS)}）")
 
 
 def _agy_line(line: str):
@@ -363,6 +480,50 @@ def parse_porcelain_z(out: str) -> list[tuple[str, str]]:
             i += 1  # 跳過舊路徑
         res.append((xy, path))
     return res
+
+
+# ---- C4a（2026-10-05）：生產目錄守門。新實作者（Claude）沒有 Codex 的沙箱，「不碰生產目錄」這條紅線要機械化 -----
+def prod_snapshot(prod: str | None) -> str | None:
+    """生產目錄的快照字串（項目以 NUL 分隔）；None＝沒設 production_dir，或它不是 git repo（守門停用，呼叫端要說出來）。
+
+    內容：`status --porcelain -z --untracked-files=all` 每一項＋該檔的 大小:mtime_ns，最後一項是 HEAD。
+    🔴 一定要 --no-optional-locks：普通 git status 會刷新並改寫生產 repo 的 .git/index（拿 index.lock），
+       本身就是對生產目錄的寫入，還可能撞到正在運作的人／服務。
+    比規格多兩點（紅線寧可誤報）：-uall 讓「未追蹤目錄裡多一個檔」看得到；本來就髒的檔再被改，status 那行不變，
+    所以附上大小與 mtime。git 認成巢狀 repo 的目錄（例如放在生產目錄底下的 worktree）只列一項 `dir/`，不看 mtime，
+    否則實作者在那個 worktree 裡改檔就會誤報。
+    ponytail：被 .gitignore 的檔看不到（例如生產目錄的 .env、資料檔）；升級路徑＝加 `--ignored` 列表或檔案系統監看。
+    git status 本身失敗（不是「不是 repo」）→ RuntimeError：驗不了紅線就不跑。"""
+    if not prod or not Path(prod).is_dir():
+        return None
+    top = git(prod, "--no-optional-locks", "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return None
+    st = git(prod, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all", timeout=300)
+    if st.returncode != 0:
+        raise RuntimeError(f"生產目錄快照失敗（git status exit {st.returncode}）：{st.stderr.strip()[-200:]}")
+    root = Path(top.stdout.strip())
+    items = []
+    for xy, path in parse_porcelain_z(st.stdout):
+        sig = "dir"
+        if not path.endswith("/"):
+            try:
+                s = (root / path).stat()
+                sig = f"{s.st_size}:{s.st_mtime_ns}"
+            except OSError:
+                sig = "-"
+        items.append(f"{xy} {path} [{sig}]")
+    head = git(prod, "--no-optional-locks", "rev-parse", "HEAD")
+    items.append("HEAD=" + (head.stdout.strip() if head.returncode == 0 else "(無)"))
+    return "\0".join(items)
+
+
+def snapshot_delta(before: str, after: str, limit: int = 10) -> str:
+    """兩份快照的差異（給人看）：新增／消失的項目各列前 limit 筆。"""
+    b, a = before.split("\0"), after.split("\0")
+    sb, sa = set(b), set(a)
+    added, gone = [x for x in a if x not in sb], [x for x in b if x not in sa]
+    return f"新增 {added[:limit]}（共 {len(added)}）；消失 {gone[:limit]}（共 {len(gone)}）"
 
 
 # ---- C3（2026-10-05）：不同任務並行——加鎖＋全域並行上限 -------------------------------------
@@ -489,6 +650,7 @@ class Run:
         self.review_extra = ""  # resume 時附在審查核對條件後面的人工追加要求
         self.wt = task["worktree"]
         self.repo = task["repo"]
+        self.impl_cli = task.get("implementer", "codex")  # C4a：合法值由 load_task 擋（寫錯 exit 3，不再靜默用 codex）
 
     # ---- 狀態檔 ------------------------------------------------------------
     def save(self, phase: str | None = None) -> None:
@@ -638,29 +800,64 @@ class Run:
             head = "" if feedback.startswith("【人工審查意見") else "【上一輪審查／驗證的發現，請逐條修正後再回報】\n"
             prompt += "\n\n" + head + feedback
         (self.dir / f"impl_r{rnd}_prompt.md").write_text(prompt, encoding="utf-8")
-        if len(prompt) > 30000:
-            # C6：prompt 目前走 argv（Windows 命令列上限 32,767 字元）；人工意見很長時先大聲說，失敗了才知道為什麼
-            self.log(f"⚠ 實作者 prompt {len(prompt)} 字元，超過 30,000：命令列可能放不下（上限約 32K），請精簡 human_notes 或規格")
-        return prompt
+        return prompt  # C4a（2026-10-05）起 prompt 走 stdin，C6 那條「超過 30,000 字元命令列放不下」的警告已拿掉
 
-    def implement(self, rnd: int, feedback: str) -> tuple[bool, str, dict | None]:
-        prompt = self.impl_prompt(rnd, feedback)
-        out_last = self.dir / f"impl_r{rnd}_last_message.md"
-        so, se, ex = self.dir / f"impl_r{rnd}.stdout.txt", self.dir / f"impl_r{rnd}.stderr.txt", self.dir / f"impl_r{rnd}.exit.txt"
+    def guarded_implement(self, rnd: int, feedback: str, cli: str | None = None, attempt: int = 0):
+        """實作者呼叫一律走這裡（C4a，2026-10-05）：前後各取一次生產目錄快照，不同就 ProductionTouched（決策 D13）。
+        兩種實作者都套用。實作者呼叫本身丟例外時也先比一次——生產目錄被動過比那個例外更要緊。
+        誤報（別的 session／服務在這段時間寫了生產目錄）的代價是重跑；漏報的代價是紅線失守。"""
+        cli = cli or self.impl_cli
+        self.state.implementer = cli
+        prod = self.t.get("production_dir")
         if self.dry:
-            self.log(f"[dry] codex exec（round {rnd}，prompt {len(prompt)} 字）")
+            self.log(f"[dry] 生產目錄守門：{prod or '（未設 production_dir，停用）'}")
+            return self.implement(rnd, feedback, cli=cli, attempt=attempt)
+        before = prod_snapshot(prod)
+        if before is None and prod:
+            self.log(f"⚠ production_dir {prod} 不存在或不是 git repo：生產目錄守門停用（只剩 worktree ≠ 生產目錄的檢查）")
+        try:
+            res = self.implement(rnd, feedback, cli=cli, attempt=attempt)
+        except Exception:
+            self._check_prod(prod, before, cli)
+            raise
+        self._check_prod(prod, before, cli)
+        return res
+
+    def _check_prod(self, prod: str | None, before: str | None, cli: str) -> None:
+        if before is None:
+            return
+        after = prod_snapshot(prod)
+        if after != before:
+            raise ProductionTouched(f"{IMPL_NAMES.get(cli, cli)} 實作期間生產目錄 {prod} 有變動（紅線，整棒中止）："
+                                    f"{snapshot_delta(before, after or '')}。請人工檢查生產目錄；"
+                                    "若是別的 session／服務同時寫入造成的誤報，確認後重跑即可")
+
+    def implement(self, rnd: int, feedback: str, cli: str | None = None, attempt: int = 0) -> tuple[bool, str, dict | None]:
+        """呼叫實作者一次（C4a 起 codex｜claude 可插拔；prompt 一律走 stdin）。attempt>0 是同一輪換手（C5 才會用）。"""
+        cli = cli or self.impl_cli
+        prompt = self.impl_prompt(rnd, feedback)
+        stem = f"impl_r{rnd}" + (f"_a{attempt}" if attempt else "")
+        out_last = self.dir / f"{stem}_last_message.md"
+        so, se, ex = (self.dir / f"{stem}.{k}.txt" for k in ("stdout", "stderr", "exit"))
+        ic = build_impl_command(cli, self.wt, out_last, model=(self.t.get("implementer_models") or {}).get(cli),
+                                effort=(self.t.get("implementer_effort") or {}).get(cli))
+        if self.dry:
+            self.log(f"[dry] 實作者 {IMPL_NAMES[cli]}：{' '.join(ic.argv[1:])}（round {rnd}，prompt {len(prompt)} 字走 stdin）")
             return True, "(dry)", None
-        self.log(f"實作者 Codex 開跑（round {rnd}）…")
+        self.log(f"實作者 {IMPL_NAMES[cli]} 開跑（round {rnd}）…")
         t0 = time.monotonic()
-        cp = stream([CODEX, "exec", "--json", "-s", "workspace-write", "-C", self.wt, "-o", str(out_last), prompt],
-                    "CODEX", _codex_line, cwd=self.wt, timeout=self.t.get("impl_timeout", 1500), logf=self.dir / "relay.log")
+        cp = stream(ic.argv, ic.prefix, ic.line_fn, cwd=self.wt, timeout=self.t.get("impl_timeout", 1500),
+                    logf=self.dir / "relay.log", input_text=prompt, drop_env=ic.drop_env)
         so.write_text(cp.stdout, encoding="utf-8"); se.write_text(cp.stderr, encoding="utf-8"); ex.write_text(f"exit={cp.returncode}", encoding="utf-8")
-        v = judge.judge("codex", cp.stdout, cp.stderr, cp.returncode)
+        v = judge.judge(cli, cp.stdout, cp.stderr, cp.returncode)
         rec = CallRecord("implementer", rnd, v.ok, v.reason, cp.returncode, round(time.monotonic() - t0, 1), v.usage, str(so),
-                         cli="codex", failure_class=v.failure_class)
+                         cli=cli, failure_class=v.failure_class)
         self.record(rec)
         self.log(f"實作者結束：{'OK' if v.ok else 'FAIL'}（{rec.seconds}s，{v.reason}）usage={v.usage}")
-        report = out_last.read_text(encoding="utf-8") if out_last.exists() else (v.result_text or "")
+        if cli == "codex":  # codex 的最終訊息在 -o 檔；claude 的在 stream-json 最後的 result 物件（判定器已抽出）
+            report = out_last.read_text(encoding="utf-8") if out_last.exists() else (v.result_text or "")
+        else:
+            report = v.result_text or ""
         return v.ok, report, v.usage
 
     # ---- 3. 驗證 -------------------------------------------------------------
@@ -913,7 +1110,7 @@ class Run:
             self.state.round = rnd
             self.write_current(f"# CURRENT\n\n任務 {self.t['id']} round {rnd}/{last}：實作中。worktree `{self.wt}`。\n")
             self.save("implement")
-            ok, impl_report, _ = self.implement(rnd, feedback)
+            ok, impl_report, _ = self.guarded_implement(rnd, feedback)
             if not ok and not self.dry:
                 feedback = "實作者的 CLI 呼叫沒有正常結束（判定器：" + self.state.calls[-1]["reason"] + "）。請重做規格。"
                 self.state.last_feedback = feedback
@@ -975,7 +1172,9 @@ class Run:
         if self.state.verdict == "converged":
             paths = self.changed_paths()  # 一律對 HEAD：resume 已 commit 過的棒時只收增量
             again = f"；人工意見回灌第 {len(self.state.resumed)} 次" if self.resuming else ""
-            msg = f"{self.t.get('title', self.t['id'])}\n\n（編排器 relay.py：Codex 實作、agy 審查、驗證指令全過；task {self.t['id']}{again}）\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n"
+            # 決策 D15（2026-10-05）：拿掉寫死的 Co-Authored-By 行（以前把 Codex 的產出記成 Claude 共同作者），改在內文寫實際角色
+            who = IMPL_NAMES.get(self.state.implementer or self.impl_cli, self.state.implementer or self.impl_cli)
+            msg = f"{self.t.get('title', self.t['id'])}\n\n（編排器 relay.py：{who} 實作、agy 審查、驗證指令全過；task {self.t['id']}{again}）\n"
             self.state.commit = self.commit(paths, msg)
             self.state.commits.append(self.state.commit)  # 不改寫既有 commit：同一 branch 上疊新的一顆
             self.save("done")
@@ -1145,7 +1344,28 @@ def load_task(path: Path) -> dict:
     prod = task.get("production_dir")
     if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
         raise TaskError("worktree 不得等於生產目錄")
+    # C4a（2026-10-05）：以前 implementer 欄位從沒被讀過，寫什麼都靜默用 Codex；現在寫錯就 exit 3
+    impl = task.get("implementer", "codex")
+    if impl not in IMPLEMENTERS:
+        raise TaskError(f"implementer 不合法：{impl!r}（只能是 {' / '.join(IMPLEMENTERS)}；省略＝codex）")
+    for key, allowed in (("implementer_models", IMPLEMENTERS), ("implementer_effort", ("claude",))):
+        v = task.get(key)
+        if v is not None and not (isinstance(v, dict) and all(k in allowed and isinstance(x, str) and x.strip()
+                                                               for k, x in v.items())):
+            raise TaskError(f"{key} 必須是 {{實作者: 非空字串}}，實作者只能是 {' / '.join(allowed)}（給的是 {v!r}）")
+    eff = (task.get("implementer_effort") or {}).get("claude")
+    if eff is not None and eff not in CLAUDE_EFFORTS:
+        raise TaskError(f"implementer_effort.claude 不合法：{eff!r}（只能是 {' / '.join(CLAUDE_EFFORTS)}）")
     return task
+
+
+def required_clis(task: dict) -> dict:
+    """環境自檢要哪幾支 CLI（C4a，2026-10-05）→ paths.check_all 的 keyword 參數。
+    以前一律要 codex＋agy：review.policy=never 也要求裝 agy（與 README 不符）、claude 實作者也要求裝 codex。
+    「用到的實作者」目前只有 implementer 一個；C5（list）／C4（candidates[*].implementer）落地時在這裡併入。"""
+    impl = {task.get("implementer", "codex")}
+    return {"need_codex": "codex" in impl, "need_claude": "claude" in impl,
+            "need_agy": task["review"].get("policy", "always") != "never"}
 
 
 # ---- C6（2026-10-05）：人工意見回灌 relay.py --resume <task_id> --------------------------------------
@@ -1269,26 +1489,27 @@ def main(argv=None) -> int:
         return 3
     if not a.task and not a.resume:
         ap.error("缺 task 檔")
+    plan = None
+    try:
+        if a.resume:
+            plan = prepare_resume(a.resume, a.task, a.rounds)
+            task = plan.task
+        else:
+            task = load_task(Path(a.task))
+    except TaskError as e:
+        print(("relay 拒絕 resume：" if a.resume else "") + str(e), file=sys.stderr)
+        return 3
+    # C4a（2026-10-05）：先讀任務才知道要哪幾支 CLI（見 required_clis）；dry-run 不呼叫 CLI，不檢查
     if not a.dry_run:
-        missing = paths.check_all()
+        missing = paths.check_all(**required_clis(task))
         if missing:
             print("環境缺少 CLI,無法動工:\n  - " + "\n  - ".join(missing), file=sys.stderr)
             return 3
-    if a.resume:
-        try:
-            plan = prepare_resume(a.resume, a.task, a.rounds)
-        except TaskError as e:
-            print("relay 拒絕 resume：", e, file=sys.stderr)
-            return 3
-        run = Run(plan.task, a.dry_run, task_file=plan.task_file, no_notify=a.no_notify, resume_state=plan.state)
-        return _execute(run, plan.task, a, plan)
-    try:
-        task = load_task(Path(a.task))
-    except TaskError as e:
-        print(e, file=sys.stderr)
-        return 3
-    run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()), no_notify=a.no_notify)
-    return _execute(run, task, a)
+    if plan:
+        run = Run(task, a.dry_run, task_file=plan.task_file, no_notify=a.no_notify, resume_state=plan.state)
+    else:
+        run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()), no_notify=a.no_notify)
+    return _execute(run, task, a, plan)
 
 
 def _execute(run: Run, task: dict, a, plan: ResumePlan | None = None) -> int:

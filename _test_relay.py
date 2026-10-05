@@ -1,5 +1,6 @@
 """_test_relay.py — relay 的純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本、改動判定、
-陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）、人工意見回灌 --resume（C6）。不呼叫任何 AI CLI。
+陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）、人工意見回灌 --resume（C6）、
+實作者可插拔 codex｜claude＋生產目錄守門（C4a）。不呼叫任何 AI CLI。
 
 跑法：PYTHONUTF8=1 python _test_relay.py   （exit 0＝全過）
 """
@@ -794,7 +795,7 @@ def test_notify() -> None:
                   "spec_file": str(d / "spec.md"), "verify": [], "review": {"policy": "always", "instructions_file": str(d / "rev.md")}}
             (d / "task.json").write_text(json.dumps(mt), encoding="utf-8")
             orig_run, orig_check, orig_nl = relay.Run.run, relay.paths.check_all, relay.NOTIFY_LEDGER
-            relay.paths.check_all = lambda: []
+            relay.paths.check_all = lambda **kw: []  # C4a 起 main 以 keyword 傳需求
 
             def run_ok(self):  # 假的「收斂」：只做會推播的那一步
                 self.notify("ready_to_merge")
@@ -902,21 +903,24 @@ def test_notify_telegram() -> None:
 class ScriptedRun(relay.Run):
     """規格 §12 共用測試骨架（2026-10-05，C6 起用）：implement／verify／review／negative_control 依腳本回傳，
     不呼叫任何 CLI。prompt 與審查指令沿用真的組法（impl_prompt／review_inputs），才驗得到兩個角色實際拿到什麼。
-    script＝{"impl": [{"write": {相對路徑: 內容}}…], "verify": [bool…], "review": [(approved, 原文)…]}，每次呼叫 pop 一筆。"""
+    script＝{"impl": [{"write": {相對路徑: 內容}}…], "verify": [bool…], "review": [(approved, 原文)…]}，每次呼叫 pop 一筆。
+    C4a（2026-10-05）：impl 步驟另可給 {"write_abs": {絕對路徑: 內容}}（模擬實作者寫到 worktree 外，例如生產目錄）。"""
 
     def __init__(self, task, script, **kw):
         super().__init__(task, dry=False, **kw)
         self.script = script
         self.calls_log: list[dict] = []
 
-    def implement(self, rnd, feedback, *a, **kw):
+    def implement(self, rnd, feedback, cli=None, attempt=0):
         step = self.script["impl"].pop(0)
         prompt = self.impl_prompt(rnd, feedback)
-        self.calls_log.append({"role": "impl", "round": rnd, "feedback": feedback, "prompt": prompt})
+        self.calls_log.append({"role": "impl", "round": rnd, "feedback": feedback, "prompt": prompt, "cli": cli})
         for name, text in step.get("write", {}).items():
             Path(self.wt, name).write_bytes(text.encode("utf-8"))
+        for name, text in step.get("write_abs", {}).items():
+            Path(name).write_bytes(text.encode("utf-8"))
         ok = step.get("ok", True)
-        self.record(relay.CallRecord("implementer", rnd, ok, "scripted", 0, 0.0, None, "", cli="codex",
+        self.record(relay.CallRecord("implementer", rnd, ok, "scripted", 0, 0.0, None, "", cli=cli or "codex",
                                      failure_class=step.get("failure_class")))
         return ok, f"（腳本實作者第 {rnd} 輪）", None
 
@@ -950,7 +954,7 @@ def scripted_main(script: dict, made: list):
         made.append(r)
         return r
 
-    relay.Run, relay.paths.check_all = factory, (lambda: [])
+    relay.Run, relay.paths.check_all = factory, (lambda **kw: [])
     try:
         yield
     finally:
@@ -1196,7 +1200,7 @@ def test_resume() -> None:
 
             # ---- dry-run＋resume：只印計畫（讀 notes、不改名、不寫 .dry 以外的檔）--------------------
             before = snap(rd, wt)
-            relay.paths.check_all, orig_check = (lambda: ["不該被呼叫"]), relay.paths.check_all
+            relay.paths.check_all, orig_check = (lambda **kw: ["不該被呼叫"]), relay.paths.check_all
             try:
                 rc, err = call(["--resume", tid, "--dry-run"])
             finally:
@@ -1211,6 +1215,290 @@ def test_resume() -> None:
                 rm_runs(t)
 
 
+FAKE_CLAUDE = r'''import os, sys
+from pathlib import Path
+data = sys.stdin.buffer.read()
+out = Path(sys.argv[2])
+(out / "got_prompt.bin").write_bytes(data)
+(out / "env_seen.txt").write_text("yes" if "CLAUDECODE" in os.environ else "no", encoding="utf-8")
+sys.stdout.write(Path(sys.argv[1]).read_text(encoding="utf-8"))
+'''
+
+
+def test_impl_command() -> None:
+    """C4a（2026-10-05）：實作者可插拔 codex｜claude、prompt 走 stdin、生產目錄守門、需求計算、IMPL_RULES 不寫死路徑。
+    不呼叫任何 AI CLI：claude 的管線測試用假 CLI（python 腳本）吐 fixtures/claude_stream_ok 的真樣本。"""
+    import shutil
+    import subprocess
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def init_repo(p: Path, branch: str | None = None) -> None:
+        p.mkdir(parents=True)
+        g(p, "init", "-q", "-b", "main"); g(p, "config", "user.email", "t@t"); g(p, "config", "user.name", "t")
+        g(p, "config", "core.autocrlf", "false")
+        (p / "a.py").write_bytes(b"x = 0\n")
+        g(p, "add", "-A"); g(p, "commit", "-qm", "base")
+        if branch:
+            g(p, "checkout", "-q", "-b", branch)
+
+    # 1. claude 的指令（4 項）
+    out_rel = Path("runs") / "_x_last.md"
+    c = relay.build_impl_command("claude", "C:/code/wt", out_rel)
+    av = c.argv
+    tools = av[av.index("--tools") + 1] if "--tools" in av else ""
+    check("claude 指令：--tools 只有讀寫檔五個、不含 Bash", "Bash" not in tools and set(tools.split(",")) == {"Read", "Edit", "Write", "Glob", "Grep"}, str(av))
+    check("claude 指令：--strict-mcp-config＋空 mcpServers＋--safe-mode（D12）", "--strict-mcp-config" in av and "--safe-mode" in av
+          and json.loads(av[av.index("--mcp-config") + 1]) == {"mcpServers": {}}, str(av))
+    check("claude 指令：-p＋stream-json＋--verbose＋acceptEdits＋--no-session-persistence",
+          "-p" in av and av[av.index("--output-format") + 1] == "stream-json" and "--verbose" in av
+          and av[av.index("--permission-mode") + 1] == "acceptEdits" and "--no-session-persistence" in av, str(av))
+    check("claude 指令：prompt 不在 argv（沒有守則字串、沒有 '-'）；drop_env＝paths.CLAUDE_NESTED_ENV；前綴 CLAUDE",
+          not any("守則" in x for x in av) and "-" not in av and c.drop_env == relay.paths.CLAUDE_NESTED_ENV and c.prefix == "CLAUDE", str(c))
+    # 2. codex 的指令（3 項）
+    k = relay.build_impl_command("codex", "C:/code/wt", out_rel)
+    check("codex 指令：最後一個參數是 '-'（prompt 從 stdin 讀）", k.argv[-1] == "-", str(k.argv))
+    check("codex 指令：-s workspace-write、前綴 CODEX、不刪 env", k.argv[k.argv.index("-s") + 1] == "workspace-write"
+          and k.prefix == "CODEX" and k.drop_env == (), str(k.argv))
+    o = k.argv[k.argv.index("-o") + 1]
+    check("codex 指令：-o 是絕對路徑（相對路徑會以 -C 為基準落進受測 repo）", Path(o).is_absolute() and o.endswith("_x_last.md"), o)
+    # 3. model／effort 有給才出現（2 項＋錯誤 1 項）
+    c1, c0 = relay.build_impl_command("claude", "w", out_rel, model="sonnet", effort="high"), relay.build_impl_command("claude", "w", out_rel)
+    check("claude：model／effort 有給才出現 --model sonnet／--effort high",
+          c1.argv[c1.argv.index("--model") + 1] == "sonnet" and c1.argv[c1.argv.index("--effort") + 1] == "high"
+          and "--model" not in c0.argv and "--effort" not in c0.argv, str(c1.argv))
+    k1 = relay.build_impl_command("codex", "w", out_rel, model="gpt-x")
+    check("codex：model 有給才出現 -m（且仍在 '-' 之前）", k1.argv[k1.argv.index("-m") + 1] == "gpt-x" and k1.argv[-1] == "-"
+          and "-m" not in k.argv, str(k1.argv))
+    errs = []
+    for kw in ({"cli": "gemini"}, {"cli": "codex", "effort": "high"}):
+        try:
+            relay.build_impl_command(kw.pop("cli"), "w", out_rel, **kw)
+            errs.append(False)
+        except ValueError:
+            errs.append(True)
+    check("build_impl_command：未知實作者、codex 給 effort → ValueError（大聲錯，不靜默）", all(errs), str(errs))
+
+    # 4. stream() 的 input_text／drop_env（2 項＋提早退出 1 項）
+    big = ("x" * 99 + "\n") * 1000
+    with contextlib.redirect_stdout(io.StringIO()):
+        cp = relay.stream([sys.executable, "-c", "import sys;b=sys.stdin.buffer.read();print(len(b), b.count(b'\\r'))"],
+                          "RELAY", None, input_text=big, timeout=120)
+    check("stream(input_text)：10 萬字元經 stdin 原樣送達（不受 32K 限制、不互卡、\\n 沒被轉成 \\r\\n）",
+          cp.returncode == 0 and cp.stdout.strip() == "100000 0", f"rc={cp.returncode} out={cp.stdout!r}")
+    probe = [sys.executable, "-c", "import os;print(os.environ.get('RELAY_TEST_FOO', '<none>'))"]
+    os.environ["RELAY_TEST_FOO"] = "1"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            cp_drop = relay.stream(probe, "RELAY", None, drop_env=("RELAY_TEST_FOO",), timeout=60)
+            cp_keep = relay.stream(probe, "RELAY", None, timeout=60)
+    finally:
+        os.environ.pop("RELAY_TEST_FOO", None)
+    check("stream(drop_env)：外部設 RELAY_TEST_FOO=1 → 子行程看不到（對照：不給 drop_env 看得到）",
+          cp_drop.stdout.strip() == "<none>" and cp_keep.stdout.strip() == "1", f"{cp_drop.stdout!r} {cp_keep.stdout!r}")
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        cp = relay.stream([sys.executable, "-c", "import sys;sys.exit(5)"], "RELAY", None, input_text="y" * 5_000_000, timeout=60)
+    check("stream(input_text)：子行程沒讀 stdin 就退出 → 寫入端的 BrokenPipe 被吞掉、照常回 exit code",
+          cp.returncode == 5 and "Traceback" not in err.getvalue(), f"rc={cp.returncode} {err.getvalue()[-200:]!r}")
+
+    # 5. _claude_line（4 項＋真樣本 1 項）
+    L = relay._claude_line
+    ev = lambda *blocks: json.dumps({"type": "assistant", "message": {"content": list(blocks)}}, ensure_ascii=False)  # noqa: E731
+    check("_claude_line：assistant text → 💬 前 100 字（換行壓成空白）",
+          L(ev({"type": "text", "text": "我先讀檔\n再改"})) == "💬 我先讀檔 再改" and len(L(ev({"type": "text", "text": "長" * 300}))) == 102)
+    check("_claude_line：tool_use Edit → ✏ Edit <basename>；Read → $ Read <basename>",
+          L(ev({"type": "tool_use", "name": "Edit", "input": {"file_path": "C:\\code\\proj\\pkg\\mod.py"}})) == "✏ Edit mod.py"
+          and L(ev({"type": "tool_use", "name": "Read", "input": {"file_path": "/code/proj/README.md"}})) == "$ Read README.md")
+    res = {"type": "result", "is_error": False, "usage": {"input_tokens": 2, "cache_creation_input_tokens": 10,
+                                                            "cache_read_input_tokens": 3, "output_tokens": 4}}
+    check("_claude_line：result → ✓ 完成 in=<三者相加> out=<output>", L(json.dumps(res)) == "✓ 完成 in=15 out=4", str(L(json.dumps(res))))
+    check("_claude_line：非 JSON／壞 JSON／其他事件 → None",
+          L("not json") is None and L("{broken") is None and L(json.dumps({"type": "user"})) is None and L("") is None)
+    fx = relay.HERE / "fixtures" / "claude_stream_ok.stdout.txt"
+    shown = [s for s in (L(x) for x in fx.read_text(encoding="utf-8").splitlines()) if s]
+    check("_claude_line：真樣本 claude_stream_ok 只印兩行（💬 OK、✓ 完成 in=5919 out=4）", shown == ["💬 OK", "✓ 完成 in=5919 out=4"], str(shown))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        orig_ledger = relay.LEDGER
+        relay.LEDGER = d / "ledger.jsonl"
+        try:
+            # 4b. implement() 管線：假 claude 吐真樣本（2 項）
+            wt = d / "wt"
+            wt.mkdir()
+            (d / "spec.md").write_text("規格第一行\n第二行\n", encoding="utf-8")
+            (d / "fake_claude.py").write_text(FAKE_CLAUDE, encoding="utf-8")
+            orig_build, seen = relay.build_impl_command, {}
+
+            def fake_build(cli, wt_, out_last, model=None, effort=None):
+                real = orig_build(cli, wt_, out_last, model=model, effort=effort)
+                seen.update(cli=cli, model=model, effort=effort)
+                return relay.ImplCmd([sys.executable, str(d / "fake_claude.py"), str(fx), str(d)], real.prefix, real.line_fn, real.drop_env)
+
+            tid = "_test_impl_fake_claude"
+            env_bak = os.environ.get("CLAUDECODE")
+            os.environ["CLAUDECODE"] = "1"  # 模擬在 Claude Code 對話裡跑 relay
+            try:
+                relay.build_impl_command = fake_build
+                r = relay.Run({"id": tid, "worktree": str(wt), "repo": str(wt), "spec_file": str(d / "spec.md"),
+                               "implementer": "claude", "implementer_models": {"claude": "sonnet"},
+                               "implementer_effort": {"claude": "high"}}, dry=False)
+                term = io.StringIO()
+                with contextlib.redirect_stdout(term):
+                    ok, report, usage = r.implement(1, "上一輪：請修 x")
+                rec = r.state.calls[-1] if r.state.calls else {}
+                check("implement(claude)：判定 ok、報告＝result 文字、CallRecord.cli=claude、model／effort 照任務傳",
+                      ok and report == "OK" and rec.get("cli") == "claude" and (usage or {}).get("input_tokens_total") == 5919
+                      and seen == {"cli": "claude", "model": "sonnet", "effort": "high"} and "✓ 完成 in=5919 out=4" in term.getvalue(),
+                      f"ok={ok} report={report!r} rec={rec} seen={seen}")
+                want = (r.dir / "impl_r1_prompt.md").read_text(encoding="utf-8").encode("utf-8")
+                got = (d / "got_prompt.bin").read_bytes() if (d / "got_prompt.bin").is_file() else b""
+                check("implement(claude)：prompt 經 stdin 逐位元組送達（無 \\r）、子行程看不到 CLAUDECODE",
+                      got == want and b"\r" not in got and "【規格】" in got.decode("utf-8")
+                      and (d / "env_seen.txt").read_text(encoding="utf-8") == "no", f"len got={len(got)} want={len(want)}")
+            finally:
+                relay.build_impl_command = orig_build
+                if env_bak is None:
+                    os.environ.pop("CLAUDECODE", None)
+                else:
+                    os.environ["CLAUDECODE"] = env_bak
+                rm_runs(tid)
+
+            # 6. implementer 欄位驗證（2 項＋models／effort 1 項）
+            (d / "rev.md").write_text("1. x 有改", encoding="utf-8")
+            base = {"id": "_test_impl_task", "repo": str(d / "nope"), "base_branch": "main", "branch": "feat/x",
+                    "worktree": str(d / "nope_wt"), "spec_file": str(d / "spec.md"), "verify": [],
+                    "review": {"policy": "always", "instructions_file": str(d / "rev.md")}}
+
+            def main_rc(extra: dict, *flags: str) -> tuple[int, str]:
+                tf = d / "t.json"
+                tf.write_text(json.dumps({**base, **extra}, ensure_ascii=False), encoding="utf-8")
+                e = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(e):
+                    rc = relay.main([str(tf), *flags])
+                return rc, e.getvalue()
+
+            rc, e = main_rc({"implementer": "gemini"}, "--dry-run")
+            check("task implementer='gemini' → main 回 3（dry-run 也擋；訊息點名 implementer）", rc == 3 and "implementer" in e, f"rc={rc} {e!r}")
+            (d / "t0.json").write_text(json.dumps(base), encoding="utf-8")
+            t0 = relay.load_task(d / "t0.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                r0 = relay.Run(t0, dry=True)
+            check("task 缺 implementer → 預設 codex（Run.impl_cli 與需求計算）",
+                  r0.impl_cli == "codex" and relay.required_clis(t0) == {"need_codex": True, "need_claude": False, "need_agy": True})
+            rm_runs("_test_impl_task")
+            rcs = [main_rc(x, "--dry-run")[0] for x in ({"implementer_effort": {"codex": "high"}}, {"implementer_effort": {"claude": "turbo"}},
+                                                         {"implementer_models": {"gemini": "x"}}, {"implementer_models": {"claude": ""}},
+                                                         {"implementer": ["codex", "claude"]})]
+            check("implementer_models／implementer_effort 寫錯、implementer 給 list（C5 前不支援）→ main 回 3", rcs == [3] * 5, str(rcs))
+
+            # 8. check_all 需求計算（2 項）
+            calls: list = []
+
+            def rec_check(**kw):
+                calls.append(kw)
+                return ["（測試）假裝缺 CLI"]
+
+            orig_check = relay.paths.check_all
+            relay.paths.check_all = rec_check
+            try:
+                rc1, _ = main_rc({"review": {**base["review"], "policy": "never"}})
+                rc2, _ = main_rc({"implementer": "claude"})
+            finally:
+                relay.paths.check_all = orig_check
+            check("check_all 需求：policy=never＋codex → 不要求 agy、不要求 claude", rc1 == 3 and calls[:1] == [
+                {"need_codex": True, "need_agy": False, "need_claude": False}], str(calls))
+            check("check_all 需求：implementer=claude＋policy=always → 要求 claude 與 agy、不要求 codex", rc2 == 3 and calls[1:2] == [
+                {"need_codex": False, "need_agy": True, "need_claude": True}], str(calls))
+            rm_runs("_test_impl_task")
+
+            # 7. prod_snapshot（3 項＋對照 1 項）
+            prod = d / "prod"
+            init_repo(prod)
+            s1 = relay.prod_snapshot(str(prod))
+            (prod / "a.py").write_bytes(b"x = 1\n")
+            s2 = relay.prod_snapshot(str(prod))
+            (prod / "a.py").write_bytes(b"x = 0\n")
+            s3 = relay.prod_snapshot(str(prod))
+            check("prod_snapshot：改一個追蹤檔 → 快照不同；還原內容 → 與原快照相同", s1 is not None and s2 != s1 and s3 == s1,
+                  f"{s1!r} / {s2!r} / {s3!r}")
+            (d / "plain").mkdir()
+            check("prod_snapshot：None 或不是 git repo → None", relay.prod_snapshot(None) is None and relay.prod_snapshot("") is None
+                  and relay.prod_snapshot(str(d / "plain")) is None and relay.prod_snapshot(str(d / "no_such_dir")) is None)
+            idx = prod / ".git" / "index"
+            st = (prod / "a.py").stat()
+            os.utime(prod / "a.py", ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))  # 內容不變、mtime 變：普通 status 會想刷新 index
+            m0, b0 = idx.stat().st_mtime_ns, idx.read_bytes()
+            relay.prod_snapshot(str(prod))
+            check("prod_snapshot：呼叫後生產 repo 的 .git/index mtime 與內容都不變（--no-optional-locks）",
+                  idx.stat().st_mtime_ns == m0 and idx.read_bytes() == b0)
+            g(prod, "status", "--porcelain")
+            check("對照：同樣情況下普通 git status 會改寫 .git/index（證明上一條量得到）", idx.read_bytes() != b0 or idx.stat().st_mtime_ns != m0)
+            (prod / "untracked").mkdir()
+            (prod / "untracked" / "f1.txt").write_bytes(b"1\n")
+            s4 = relay.prod_snapshot(str(prod))
+            (prod / "untracked" / "f2.txt").write_bytes(b"2\n")
+            (prod / "a.py").write_bytes(b"x = 9\n")
+            s5 = relay.prod_snapshot(str(prod))
+            (prod / "a.py").write_bytes(b"x = 99\n")
+            s6 = relay.prod_snapshot(str(prod))
+            check("prod_snapshot：未追蹤目錄裡多一個檔、本來就髒的檔再被改 → 都看得到（比規格多的兩點）",
+                  s5 != s4 and "untracked/f2.txt" in s5 and s6 != s5, f"{s4!r} / {s5!r}")
+            (prod / "a.py").write_bytes(b"x = 0\n")
+            shutil.rmtree(prod / "untracked")
+
+            # 守門整合（經 main＋ScriptedRun）：實作者寫進生產目錄 → 中止；沒寫 → 收斂、commit 訊息照實寫（3 項）
+            tids = ["_test_impl_guard_hit", "_test_impl_guard_ok"]
+            for tid in tids:
+                init_repo(d / tid, branch="feat/c4a")
+            (d / "spec.md").write_text("把 x 改掉", encoding="utf-8")
+
+            def guard_task(tid: str) -> Path:
+                t = {**base, "id": tid, "title": "c4a 守門", "repo": str(d / tid), "worktree": str(d / tid), "branch": "feat/c4a",
+                     "production_dir": str(prod), "verify": [{"name": "v", "cmd": "echo ok"}], "allowed_paths": ["a.py"],
+                     "max_rounds": 1, "implementer": "claude"}
+                tf = d / f"{tid}.json"
+                tf.write_text(json.dumps(t, ensure_ascii=False), encoding="utf-8")
+                return tf
+
+            try:
+                made: list = []
+                hit = {"impl": [{"write": {"a.py": "x = 1\n"}, "write_abs": {str(prod / "evil.txt"): "x"}}], "verify": [True],
+                       "review": [(True, "總判定：可合併")]}
+                head0 = g(d / tids[0], "rev-parse", "HEAD").stdout
+                with scripted_main(hit, made), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = relay.main([str(guard_task(tids[0]))])
+                s = json.loads((relay.HERE / "runs" / tids[0] / "STATE.json").read_text(encoding="utf-8"))
+                check("守門：實作者寫進生產目錄 → exit 3、STATE aborted、原因點名生產目錄與 evil.txt、沒有 commit",
+                      rc == 3 and s["phase"] == "aborted" and "生產目錄" in s["abort_reason"] and "evil.txt" in s["abort_reason"]
+                      and g(d / tids[0], "rev-parse", "HEAD").stdout == head0, f"rc={rc} {s.get('abort_reason')!r}")
+                (prod / "evil.txt").unlink()
+                made = []
+                with scripted_main({"impl": [{"write": {"a.py": "x = 2\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}, made), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = relay.main([str(guard_task(tids[1]))])
+                s = json.loads((relay.HERE / "runs" / tids[1] / "STATE.json").read_text(encoding="utf-8"))
+                check("守門：生產目錄沒被動 → 不誤報、收斂 exit 0、STATE.implementer=claude、實作者拿到 cli=claude",
+                      rc == 0 and s["phase"] == "done" and s.get("implementer") == "claude"
+                      and bool(made) and made[0].calls_log[0].get("cli") == "claude", f"rc={rc} {s.get('abort_reason')!r}")
+                body = g(d / tids[1], "log", "-1", "--format=%B").stdout
+                check("commit 訊息（D15）：寫「Claude Code 實作、agy 審查」、沒有 Co-Authored-By", "Claude Code 實作、agy 審查" in body
+                      and "Co-Authored-By" not in body, body)
+            finally:
+                for tid in tids:
+                    rm_runs(tid)
+        finally:
+            relay.LEDGER = orig_ledger
+
+    # 9. IMPL_RULES 不寫死本機路徑（1 項）：檢查原始碼（執行時的 IMPL_RULES 本來就會含 {HERE}，在 D: 槽也會有 "D:\"）
+    src = Path(relay.__file__).read_text(encoding="utf-8")
+    seg = src[src.index("IMPL_RULES = "):src.index("REVIEW_RULES = ")]
+    check("IMPL_RULES 原始碼不含 \"D:\\\" 字面與 Tooling；執行時改用 {HERE}",
+          "D:\\" not in seg and "Tooling" not in seg and str(relay.HERE) in relay.IMPL_RULES, seg[:200])
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -1223,7 +1511,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram, test_resume):
+                   test_notify, test_notify_telegram, test_resume, test_impl_command):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()

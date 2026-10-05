@@ -1,6 +1,6 @@
 """_test_judge.py — judge.py 的契約測試（常設，每次 CLI 升版就重跑）。
 
-fixtures/ 裡是 2026-09-07 在本機抓的真實樣本（來源與指令見 fixtures/README.md）。
+fixtures/ 裡是 2026-09-07 在本機抓的真實樣本（C4a 的 claude_stream_ok／codex_stdin_ok 是 2026-10-05；來源與指令見 fixtures/README.md）。
 CLI 一升版、欄位語意一變，這裡就會紅燈；沒有這組測試，編排器會默默把失敗記成成功。
 
 跑法：PYTHONUTF8=1 python _test_judge.py   （exit 0＝全過）
@@ -246,10 +246,29 @@ def test_agy() -> None:
           judge.judge("agy", "Authentication required...\n", "", 1).failure_class == judge.FAIL_NO_JSON)
 
 
+# ---------------------------------------------------------------------------
+# 8. C4a（2026-10-05）實作者可插拔的兩份真樣本：claude 的 stream-json（帶 relay 實作者全部旗標含 --safe-mode）、
+#    codex 的 stdin 版（prompt 給 "-"）。relay 的實作者呼叫就是這兩種形狀
+# ---------------------------------------------------------------------------
+
+def test_impl_fixtures() -> None:
+    out = read("claude_stream_ok.stdout.txt")
+    v = judge.judge("claude", out, read("claude_stream_ok.stderr.txt"), read_exit("claude_stream_ok.exit.txt"))
+    check("claude_stream_ok（stream-json 逐行事件，取最後的 result）→ ok", v.ok, v.reason)
+    check("claude_stream_ok result_text 含 OK", "OK" in (v.result_text or ""), repr(v.result_text))
+    check("claude_stream_ok usage.input_tokens_total>0、無矛盾",
+          bool(v.usage) and v.usage["input_tokens_total"] > 0 and not v.contradictions, f"{v.usage} {v.contradictions}")
+    init = next((x for x in judge.extract_json_values(out)[0] if isinstance(x, dict) and x.get("subtype") == "init"), {})
+    check("claude_stream_ok init 事件：--tools 生效（沒有 Bash）、--strict-mcp-config 生效（mcp_servers 空）",
+          bool(init.get("tools")) and "Bash" not in init["tools"] and init.get("mcp_servers") == [], str(init.get("tools")))
+    v = judge.judge("codex", read("codex_stdin_ok.stdout.txt"), read("codex_stdin_ok.stderr.txt"), read_exit("codex_stdin_ok.exit.txt"))
+    check("codex_stdin_ok（prompt 走 stdin）→ ok、result_text=OK", v.ok and v.result_text == "OK", f"{v.reason} {v.result_text!r}")
+
+
 def main() -> int:
     for fn in (test_real_fixtures, test_naive_contrast, test_gemini_success_shape_synthetic,
                test_exit_code_is_evidence_not_boolean, test_extract_json_values, test_codex_edge_cases,
-               test_agy):
+               test_agy, test_impl_fixtures):
         print(f"--- {fn.__name__} ---")
         fn()
     print(f"\n{PASSED} passed / {len(FAILED)} failed")

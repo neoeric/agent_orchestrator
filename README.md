@@ -1,6 +1,6 @@
 # agent_orchestrator
 
-讓三個 AI CLI 分工跑完一個子任務的編排器：**Codex 實作 → 測試驗證 → Antigravity（agy）審查 → 判定器核對**，
+讓 AI CLI 分工跑完一個子任務的編排器：**Codex 或 Claude Code 實作（task 的 `implementer`）→ 測試驗證 → Antigravity（agy）審查 → 判定器核對**，
 不收斂就把審查意見餵回實作者再跑一輪。工作狀態全部外部化成檔案，不依賴任何一方的對話記憶。
 
 編排器獨立安裝一次，用 `git worktree` 在隔離目錄裡改碼，**永遠不碰你的生產目錄**。
@@ -20,7 +20,8 @@
 | 項目 | 用途 | 沒有會怎樣 |
 |---|---|---|
 | Python 3.11+ | 跑 relay 與驗證指令 | — |
-| [Codex CLI](https://github.com/openai/codex) | 實作者角色 | 啟動時報錯停下 |
+| [Codex CLI](https://github.com/openai/codex) | 實作者（預設，`implementer=codex`） | 啟動時報錯停下（只有用到 codex 實作者時才檢查） |
+| Claude Code CLI | 實作者（選用，`implementer=claude`） | 只有 `implementer=claude` 時才檢查 |
 | Antigravity CLI（`agy`） | 審查者角色 | 啟動時報錯停下（`review.policy` 全設 `never` 則不需要） |
 | git 2.16+ | `git worktree` 隔離 | — |
 
@@ -45,12 +46,12 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
   "worktree": "C:/code/_worktrees/my-task",
   "production_dir": "C:/code/myproject",
   "spec_file": "tasks/my-task.spec.md",
+  "implementer": "codex",
   "prebuild": [],
   "verify": [
     {"name": "unit", "cmd": "python -m pytest tests/", "timeout": 600}
   ],
   "review": {
-    "reviewer": "agy",
     "policy": "auto",
     "instructions_file": "tasks/my-task.review.md"
   },
@@ -64,8 +65,11 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | 欄位 | 說明 |
 |---|---|
 | `repo` / `base_branch` / `branch` / `worktree` | 從 `base_branch` 開 `branch` 到 `worktree`；branch 已存在就沿用 |
-| `production_dir` | 選填但**強烈建議填**：`worktree` 等於它就直接拒跑，防手滑改到生產目錄 |
+| `production_dir` | 選填但**強烈建議填**：`worktree` 等於它就直接拒跑，防手滑改到生產目錄。它是 git repo 時另有**生產目錄守門**：每次實作者呼叫前後各取一次快照（`git --no-optional-locks status --porcelain -z -uall`＋列出檔的大小／mtime＋HEAD），不同就整棒中止（exit 3、`aborted`）。被 `.gitignore` 的檔看不到；別的 session／服務在那段時間寫了生產目錄也會中止（誤報＝重跑一棒） |
 | `spec_file` | 給實作者的完全指定規格（相對路徑以編排器目錄為基準） |
+| `implementer` | `codex`（預設）或 `claude`；其他值（含寫錯、給 list）啟動時就 exit 3，不再靜默用 Codex。prompt 一律經 stdin 送，沒有命令列長度上限 |
+| `implementer_models` | 選填 `{"claude": "sonnet", "codex": "<model>"}`：各實作者用的模型；沒給＝該 CLI 自己的預設（claude 跟著你的 Claude Code 設定走，可能是最貴的那個） |
+| `implementer_effort` | 選填 `{"claude": "high"}`（`low`／`medium`／`high`／`xhigh`／`max`）；只接受 claude，寫錯 exit 3 |
 | `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
 | `python` | 選填：verify／prebuild／陰性對照要用的 Python（例如專案 venv 的 `python.exe`）。沒設就用跑 relay 的那支直譯器；當 verify 需要的依賴只在專案 venv、而 relay 跑在別的 python 時設它（否則會拿到「缺依賴」的假紅燈）|
@@ -76,6 +80,12 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `policy.max_files` / `max_lines` | `auto` 的小改動門檻，預設 2 檔 / 60 行 |
 | `allowed_paths` | commit 時只收這些路徑；沒設就收全部改動 |
 | `max_rounds` | 幾輪不收斂就停下來給人，預設 2 |
+
+**`implementer=claude` 的隔離**（Claude 沒有 Codex 的沙箱，紅線改成「結構上做不到」）：
+`claude -p --output-format stream-json --verbose --permission-mode acceptEdits --tools Read,Edit,Write,Glob,Grep --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence --safe-mode`，cwd＝worktree。
+- **只會讀寫檔**：沒有 Bash ⇒ 不能 git commit／push、不能啟動服務、也不能跑指令。規格若要求「跑某指令產生檔案」，Claude 做不到——交給 `prebuild` 或 `verify[]`。
+- **不載入任何 MCP**（使用者環境可能有可寫 GitHub 之類的 MCP）；`--safe-mode` 不跑使用者 hooks／CLAUDE.md／使用者 skills（2026-10-05 fixture 證實 stream-json 照常）。
+- 巢狀呼叫要清的環境變數自動清掉（`tools/paths.py: CLAUDE_NESTED_ENV`）；兩種實作者都套用上面的生產目錄守門。
 
 跑：
 
@@ -99,7 +109,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 ```text
 1. 開隔離 worktree（拒絕等於 production_dir）
 2. prebuild
-3. Codex 依 spec_file 改碼（不 commit）
+3. 實作者（Codex／Claude Code）依 spec_file 改碼（不 commit）；前後比對生產目錄快照，有變動就中止
 4. verify[] 逐條跑，全部 exit 0 才算過
 4b. verify 全綠後跑 negative_controls：注入 → 必須紅在 marker → 還原
 5. 判準決定要不要送審 → agy 看 diff 唯讀審查，輸出結構化 verdict
@@ -111,6 +121,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 
 ```text
 [CODEX]  青色 · 實作者：讀哪個檔、跑什麼指令、改了什麼
+[CLAUDE] 藍色 · 實作者（implementer=claude）：讀／改了哪個檔、完成時的用量
 [AGY]    紫色 · 審查者：逐條核對與總判定
 [VERIFY] 綠色 · 驗證指令的 PASS／FAIL
 [JUDGE]  黃色 · 送審或跳過的判準
@@ -234,7 +245,7 @@ relay 不代為 checkout／reset，也**絕不從頭重跑**——狀態對不�
 
 - `review.policy=auto` 時，任務曾有驗證失敗（含 resume 之前的輪次）就一定送審。保守、可接受。
 - 從 `aborted` 接續（例如實作者動了規格外的檔）：worktree 裡可能還留著那些改動，請先自己處理，或在 notes 裡要求還原；relay 不代為 `git checkout`。
-- 實作者 prompt 目前走命令列（Windows 上限約 32K 字元）；notes 很長、prompt 超過 30,000 字元時 `relay.log` 會先警告。
+- 實作者 prompt 經 stdin 送（2026-10-05 起），notes 再長也不受命令列 32K 上限影響。
 
 ## 需要人時才推播（選用）
 
@@ -322,12 +333,12 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 ## 測試
 
 ```text
-PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌，175 項
+PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，68 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門，209 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
-`fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓），判定器契約測試靠它。
+`fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓；實作者用的 claude stream-json 與 codex stdin 兩種形狀 2026-10-05 補抓），判定器契約測試靠它。
 **任一 CLI 升版後全部重抓一輪再跑一次測試**——欄位語意變了不會有人通知你，這組測試是唯一的紅燈。
 抓法與每份樣本的重點見 `fixtures/README.md`。
 
@@ -425,6 +436,6 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 
 ## 還沒做
 
-- **換手**：實作者固定 Codex、審查者固定 agy，判定器回 `rate_limit` 時 relay 只會大聲停下，不自動換另一家。
+- **換手**：實作者可選 codex／claude，但判定器回 `rate_limit` 時仍只會停下（不自動換另一家）；審查者固定 agy。
 - **批次啟動器**：並行要自己開兩個行程（每個行程自己守 RELAY_MAX_PARALLEL 名額），沒有一個指令跑一批的 launcher。
 - 帳本只記帳，沒有據以調度。
