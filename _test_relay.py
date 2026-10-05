@@ -1815,6 +1815,256 @@ def test_handoff() -> None:
                 rm_runs(t)
 
 
+def test_candidates() -> None:
+    """C4（2026-10-05）：best-of-N 本體（規格 §7b 測試案例 1–5，另加邊界）。全程 ScriptedRun、不呼叫任何 AI CLI；
+    帳本與鎖指暫存、推播設定指到不存在的路徑（只有驗「推播只發 1 次」那段用假指令＋暫存設定）；臨時 repo 的 autocrlf 在 local 明設。"""
+    import copy
+    import re
+    import shutil
+    import subprocess
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def call(argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = relay.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def mk_repo(d: Path, gid: str, **extra) -> tuple[Path, Path, dict]:
+        """臨時 repo（main 一顆 commit），群組 worktree 在 d/wt（候選為 d/wt-c1…）；任務檔放 repo 外。"""
+        repo = d / "repo"
+        repo.mkdir(parents=True)
+        g(repo, "init", "-q", "-b", "main"); g(repo, "config", "user.email", "t@t"); g(repo, "config", "user.name", "t")
+        g(repo, "config", "core.autocrlf", "false")
+        (repo / "a.py").write_bytes(b"x = 0\n")
+        g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+        (d / "spec.md").write_text("把 x 改成 1", encoding="utf-8")
+        (d / "review.md").write_text("1. x 有改", encoding="utf-8")
+        task = {"id": gid, "title": "c4 測試", "repo": str(repo), "base_branch": "main", "branch": "feat/c4",
+                "worktree": str(d / "wt"), "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
+                "review": {"policy": "always", "instructions_file": str(d / "review.md")},
+                "allowed_paths": ["a.py"], "max_rounds": 2,
+                "candidates": [{"implementer": "codex"}, {"implementer": "claude", "model": "sonnet"}], **extra}
+        tf = d / "task.json"
+        tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+        return repo, tf, task
+
+    def rm_runs(gid: str) -> None:
+        for p in (relay.HERE / "runs").glob(gid + "*"):
+            shutil.rmtree(p, ignore_errors=True)
+
+    def st(cand: int, **kw) -> dict:
+        """合成 STATE：預設＝收斂、1 輪、verify 1/1、審查 approve、diff 10 行。"""
+        s = {"task_id": f"g.c{cand}", "phase": "done", "round": 1, "verdict": "converged", "implementer": "codex",
+             "branch": f"b-c{cand}", "commit": f"abc{cand}", "verify": [{"round": 1, "exit": 0}], "negctl": [{"round": 1, "ok": True}],
+             "review_decisions": [{"round": 1, "need_review": True}, {"round": 1, "approved": True, "unreported": []}],
+             "calls": [{"role": "reviewer", "round": 1, "ok": True, "seconds": 5.0}], "iface_gate": {},
+             "diff_stats": {"files": 1, "lines": 10}}
+        s.update(kw)
+        return s
+
+    order = lambda ss: [r["cand"] for r in relay.rank_candidates(ss)]  # noqa: E731
+
+    # ---- 1. derive_candidate_tasks（4 項＋沿用設定 1 項）-----------------------------------------------
+    base = {"id": "g", "branch": "feat/x", "worktree": "C:/code/wt", "implementer": ["codex", "claude"],
+            "implementer_models": {"codex": "m0"}, "verify": [], "candidates": [
+                {"implementer": "codex"}, {"implementer": "claude", "model": "sonnet", "effort": "high"}]}
+    snap = copy.deepcopy(base)
+    d1, d2 = relay.derive_candidate_tasks(base)
+    check("derive：id／branch／worktree 後綴正確（.c{k}／-c{k}）",
+          (d1["id"], d1["branch"], d1["worktree"]) == ("g.c1", "feat/x-c1", "C:/code/wt-c1")
+          and (d2["id"], d2["branch"], d2["worktree"]) == ("g.c2", "feat/x-c2", "C:/code/wt-c2"), str((d1["id"], d2["branch"])))
+    check("derive：candidates 被刪、輸入的 task 沒被改", "candidates" not in d1 and "candidates" not in d2 and base == snap)
+    check("derive：implementer 是單一字串（候選模式強制關閉換手）", d1["implementer"] == "codex" and d2["implementer"] == "claude")
+    check("derive：_group 是群組 id", d1["_group"] == "g" and d2["_group"] == "g")
+    check("derive：model／effort 有給才覆蓋，沒給沿用 task 的 implementer_models",
+          d1["implementer_models"] == {"codex": "m0"} and d2["implementer_models"] == {"codex": "m0", "claude": "sonnet"}
+          and d2["implementer_effort"] == {"claude": "high"} and "implementer_effort" not in d1, str((d1.get("implementer_models"), d2.get("implementer_models"))))
+
+    # ---- 4. review 欄推導（4 項＋changes 1 項）---------------------------------------------------------
+    R = relay.candidate_review
+    check("review：need_review=False → skipped", R(st(1, review_decisions=[{"round": 1, "need_review": False}], calls=[])) == "skipped")
+    check("review：最後一個 reviewer call ok=False → tool_failure",
+          R(st(1, review_decisions=[{"round": 1, "need_review": True}, {"round": 1, "approved": False}],
+               calls=[{"role": "reviewer", "round": 1, "ok": False}])) == "tool_failure")
+    check("review：approved=True → approve", R(st(1)) == "approve")
+    check("review：沒有任何審查條目（實作者失敗、沒走到審查）→ none", R(st(1, review_decisions=[], calls=[])) == "none")
+    check("review：approved=False → changes",
+          R(st(1, review_decisions=[{"round": 1, "need_review": True}, {"round": 1, "approved": False}])) == "changes")
+
+    # ---- 3. rank_candidates（6 項＋邊界 3 項）------------------------------------------------------------
+    check("rank：converged 勝過 verify 全過但未收斂者",
+          order([st(1, verdict="escalate", verify=[{"round": 1, "exit": 0}] * 3), st(2, verify=[{"round": 1, "exit": 0}, {"round": 1, "exit": 1}])]) == [2, 1])
+    check("rank：同為 converged，verify 過的多者勝",
+          order([st(1, verify=[{"round": 1, "exit": 0}, {"round": 1, "exit": 1}]), st(2, verify=[{"round": 1, "exit": 0}] * 2)]) == [2, 1])
+    chg = [{"round": 1, "need_review": True}, {"round": 1, "approved": False}]
+    check("rank：再相同時 approve 勝 changes", order([st(1, review_decisions=chg), st(2)]) == [2, 1])
+    check("rank：再相同時 breaking 少者勝",
+          order([st(1, iface_gate={"f.py": {"breaking": ["a", "b"]}}), st(2, iface_gate={"f.py": {"breaking": ["a"]}})]) == [2, 1])
+    check("rank：再相同時 diff 行數少者勝",
+          order([st(1, diff_stats={"files": 1, "lines": 30}), st(2, diff_stats={"files": 1, "lines": 5})]) == [2, 1])
+    check("rank：全部相同依 cand 順序（輸入亂序）", order([st(3), st(1), st(2)]) == [1, 2, 3])
+    rows = relay.rank_candidates([st(1, phase="aborted", verdict="converged"), st(2, verdict="escalate")])  # 1 的 verify 比較好，仍排後面
+    check("rank：phase=aborted → verdict 顯示 aborted 且排在後面（即使 verdict 欄寫過 converged）",
+          [r["cand"] for r in rows] == [2, 1] and rows[1]["verdict"] == "aborted", str([(r["cand"], r["verdict"]) for r in rows]))
+    r0 = relay.rank_candidates([st(1, verify=[], round=1, _verify_total=2, verdict="escalate")])[0]
+    check("rank：該輪沒跑 verify（實作者失敗）→ 0/任務 verify 數", (r0["verify_pass"], r0["verify_total"]) == (0, 2), str(r0))
+    r1 = relay.rank_candidates([st(1)])[0]
+    check("rank：列欄位齊全（spec 14 欄）",
+          set(r1) == {"cand", "implementer", "verdict", "verify_pass", "verify_total", "negctl_ok", "review", "breaking",
+                      "unreported", "diff_lines", "rounds", "seconds", "branch", "commit"} and r1["seconds"] == 5.0, str(sorted(r1)))
+
+    # ---- required_clis（2 項）------------------------------------------------------------------------
+    rq = relay.required_clis({"review": {"policy": "never"}, "implementer": "codex",
+                              "candidates": [{"implementer": "codex"}, {"implementer": "claude"}]})
+    rq2 = relay.required_clis({"review": {"policy": "never"}, "implementer": "claude",
+                               "candidates": [{"implementer": "codex"}, {"implementer": "codex"}]})
+    check("required_clis：candidates 含 claude → 要求 claude（也要 codex）", rq["need_claude"] and rq["need_codex"], str(rq))
+    check("required_clis：有 candidates 時 task 的 implementer 被忽略（只算候選）", rq2["need_codex"] and not rq2["need_claude"], str(rq2))
+
+    gid = "ztest-c4-grp"  # 不用 "_" 開頭：--status 會略過那種目錄，而這裡要驗 --status 看得到候選
+    orig_ledger, orig_nl = relay.LEDGER, relay.NOTIFY_LEDGER
+    orig_run, orig_check, orig_env = relay.Run, relay.paths.check_all, os.environ.get("RELAY_NOTIFY_CONFIG")
+    scripts: dict[str, dict] = {}
+    made: list = []
+
+    def factory(task, dry, **kw):
+        assert not dry, "ScriptedRun 不跑 dry-run"
+        r = ScriptedRun(task, scripts[task["id"]], **kw)
+        made.append(r)
+        return r
+
+    ok_script = lambda: {"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}  # noqa: E731
+    bad_script = lambda: {"impl": [{"write": {"a.py": "x = 2\n"}}] * 2, "verify": [False, False],  # noqa: E731
+                          "review": [(False, "總判定：需修改")] * 2}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        relay.LEDGER = d / "ledger.jsonl"
+        relay.NOTIFY_LEDGER = d / "notify_ledger.jsonl"
+        relay.paths.check_all = lambda **kw: []
+        try:
+            # ---- 2. 驗證（3 項＋邊界 3 項）：都在跑任何東西之前回 3 --------------------------------------
+            repo, tf, task = mk_repo(d / "V", gid)
+            for label, over in (("candidates 長度 1", {"candidates": [{"implementer": "codex"}]}),
+                                ("candidates 長度 4", {"candidates": [{"implementer": "codex"}] * 4}),
+                                ("候選 implementer 非法", {"candidates": [{"implementer": "codex"}, {"implementer": "gemini"}]}),
+                                ("候選 implementer 給清單（候選不換手）", {"candidates": [{"implementer": ["codex", "claude"]}, {"implementer": "codex"}]}),
+                                ("候選 effort 配 codex", {"candidates": [{"implementer": "codex", "effort": "high"}, {"implementer": "claude"}]}),
+                                ("候選 worktree 等於 production_dir", {"production_dir": str(d / "V" / "wt-c2")})):
+                tf2 = d / "V" / "t2.json"
+                tf2.write_text(json.dumps({**task, **over}, ensure_ascii=False), encoding="utf-8")
+                rc, _, err = call([str(tf2)])
+                check(f"驗證：{label} → main 回 3、沒建任何 runs", rc == 3 and not list((relay.HERE / "runs").glob(gid + "*")), f"rc={rc} {err.strip()[-120:]}")
+
+            # ---- 5. run_group：候選 1 收斂、候選 2 escalate（經 main 進入）---------------------------------
+            out_f = d / "pushed.txt"
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out_f))
+            d5 = d / "G"
+            repo, tf, task = mk_repo(d5, gid)
+            scripts.update({gid + ".c1": ok_script(), gid + ".c2": bad_script()})
+            relay.Run = factory
+            made.clear()
+            try:
+                rc, out, err = call([str(tf)])
+            finally:
+                relay.Run = orig_run
+            rk = (relay.HERE / "runs" / gid / "RANKING.md")
+            rtxt = rk.read_text(encoding="utf-8") if rk.is_file() else ""
+            check("run_group：候選 1 收斂、候選 2 escalate → exit 0", rc == 0, f"rc={rc} {err.strip()[-200:]}")
+            check("run_group：RANKING.md 第一名是 c1，指到 c1 的分支與 HANDOFF",
+                  "第一名：c1 →" in rtxt and "`feat/c4-c1`" in rtxt and f"runs/{gid}.c1/HANDOFF.md" in rtxt
+                  and rtxt.index("| 1 | c1 |") < rtxt.index("| 2 | c2 |"), rtxt[:600])
+            br = g(repo, "branch", "--list", "feat/c4-c1", "feat/c4-c2").stdout
+            wts = (d5 / "wt-c1").is_dir() and (d5 / "wt-c2").is_dir()
+            check("run_group：RANKING.md 內含清理指令字樣，但沒有被執行（c2 的 branch 與 worktree 仍在）",
+                  "worktree remove" in rtxt and "branch -D" in rtxt and "feat/c4-c2" in rtxt.split("```")[1]
+                  and "feat/c4-c2" in br and wts, f"{br!r} wts={wts}")
+            sent = out_f.read_text(encoding="utf-8") if out_f.is_file() else ""
+            check("run_group：推播假指令只被呼叫 1 次，第 1 行是群組文案", _n_sent(out_f) == 1
+                  and "best-of-2 完成：第一名 c1（codex，converged）" in sent and f"runs/{gid}/RANKING.md" in sent, repr(sent[:300]))
+            s1 = json.loads((relay.HERE / "runs" / (gid + ".c1") / "STATE.json").read_text(encoding="utf-8"))
+            s2 = json.loads((relay.HERE / "runs" / (gid + ".c2") / "STATE.json").read_text(encoding="utf-8"))
+            check("run_group：兩份候選各有自己的 STATE／branch／worktree，c2 未收斂",
+                  (s1["verdict"], s2["verdict"]) == ("converged", "escalate") and s1["branch"] == "feat/c4-c1"
+                  and s2["worktree"] == str(d5 / "wt-c2") and s1["commit"] and not s2["commit"], str((s1["branch"], s2["worktree"])))
+            check("State：negctl 每輪一筆、diff_stats 有 files／lines（單棒也寫）",
+                  s1["negctl"] == [{"round": 1, "ok": True}] and s1["diff_stats"]["files"] == 1 and s1["diff_stats"]["lines"] == 2
+                  and len(s2["negctl"]) == 2, str((s1["negctl"], s1["diff_stats"])))
+            ntf = [json.loads(ln) for ln in relay.NOTIFY_LEDGER.read_text(encoding="utf-8").splitlines()]
+            check("run_group：推播帳本只有群組 id 一筆 ready_to_merge（候選自己都沒推）",
+                  [(e["task"], e["kind"]) for e in ntf] == [(gid, "ready_to_merge")], str(ntf))
+            gj = json.loads((relay.HERE / "runs" / gid / "GROUP.json").read_text(encoding="utf-8"))
+            check("run_group：GROUP.json 記排名、第一名與候選 id；候選任務檔落在群組目錄且不含 candidates",
+                  gj["state"] == "done" and gj["first"] == 1 and gj["candidates"] == [gid + ".c1", gid + ".c2"]
+                  and "candidates" not in json.loads((relay.HERE / "runs" / gid / "cand_2.task.json").read_text(encoding="utf-8")))
+            rows_status = relay.status_report(None)
+            check("--status：列出 <id>.c1／<id>.c2（群組目錄本身不列）",
+                  f"{gid}.c1" in rows_status and f"{gid}.c2" in rows_status and not re.search(rf"^{gid}\s", rows_status, re.M), rows_status)
+            rc, _, err = call(["--resume", gid])
+            check("--resume <群組 id> → exit 3，提示指定候選 id", rc == 3 and "請指定候選 id" in err and f"{gid}.c1" in err, err.strip()[-150:])
+            tfc = relay.HERE / "runs" / gid / "cand_2.task.json"
+            rc2, _, err2 = call(["--resume", gid + ".c2", str(tfc)])
+            check("--resume <候選 id>：不被當群組拒絕（錯在缺 human_notes，不是群組）", rc2 == 3 and "human_notes" in err2 and "群組" not in err2, err2.strip()[-200:])
+            rm_runs(gid)
+
+            # ---- 邊界：全不收斂 → exit 2、推播 escalate；一份中止不影響另一份 ---------------------------------
+            repo, tf, task = mk_repo(d / "H", gid)
+            scripts.update({gid + ".c1": bad_script(), gid + ".c2": bad_script()})
+            out_h = d / "pushed_h.txt"
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out_h))
+            relay.NOTIFY_LEDGER = d / "notify_ledger_h.jsonl"
+            relay.Run = factory
+            try:
+                rc, _, _ = call([str(tf)])
+            finally:
+                relay.Run = orig_run
+            ntf = [json.loads(ln) for ln in relay.NOTIFY_LEDGER.read_text(encoding="utf-8").splitlines()]
+            check("邊界：所有候選都沒收斂 → 仍排名、exit 2、推播 kind=escalate（1 則）",
+                  rc == 2 and (relay.HERE / "runs" / gid / "RANKING.md").is_file() and [e["kind"] for e in ntf] == ["escalate"]
+                  and _n_sent(out_h) == 1, f"rc={rc} {ntf}")
+            rm_runs(gid)
+
+            repo, tf, task = mk_repo(d / "A", gid)
+            relay.NOTIFY_LEDGER = d / "notify_ledger_a.jsonl"
+            # c1 寫了規格外的檔 → 收斂時 changed_paths 丟 RuntimeError → 只中止 c1；c2 照跑
+            scripts.update({gid + ".c1": {"impl": [{"write": {"a.py": "x = 1\n", "other.py": "y = 1\n"}}], "verify": [True],
+                                          "review": [(True, "總判定：可合併")]}, gid + ".c2": ok_script()})
+            relay.Run = factory
+            try:
+                rc, _, _ = call([str(tf), "--no-notify"])
+            finally:
+                relay.Run = orig_run
+            rtxt = (relay.HERE / "runs" / gid / "RANKING.md").read_text(encoding="utf-8")
+            sa = json.loads((relay.HERE / "runs" / (gid + ".c1") / "STATE.json").read_text(encoding="utf-8"))
+            check("邊界：c1 中止（規格外改動）→ c1 顯示 aborted 排後面、c2 第一名、exit 0，--no-notify 不推播",
+                  rc == 0 and sa["phase"] == "aborted" and "| 1 | c2 |" in rtxt and "| 2 | c1 | codex | aborted |" in rtxt
+                  and not relay.NOTIFY_LEDGER.exists(), rtxt[:500])
+            rm_runs(gid)
+
+            # ---- dry-run：只印計畫、不寫 RANKING／GROUP、不建 runs/<id>（4 項）-------------------------------
+            repo, tf, task = mk_repo(d / "D", gid)
+            made.clear()
+            rc, out, err = call([str(tf), "--dry-run"])
+            plan = re.sub(r"\x1b\[[0-9;]*m", "", out)
+            runs = relay.HERE / "runs"
+            check("dry-run：群組 exit 0、印出每份候選的計畫（id／implementer／model）",
+                  rc == 0 and f"{gid}.c1" in plan and f"{gid}.c2" in plan and "claude／sonnet" in plan, plan[:500] + err[-200:])
+            check("dry-run：不寫 RANKING.md／GROUP.json，也不建 runs/<群組id>", not (runs / gid).exists())
+            check("dry-run：每份候選走自己的 dry 目錄（runs/<id>.c1.dry），沒有真實 STATE", (runs / (gid + ".c1.dry")).is_dir()
+                  and not (runs / (gid + ".c1")).exists())
+            check("dry-run：沒建任何 worktree／branch", not (d / "D" / "wt-c1").exists() and not g(repo, "branch", "--list", "feat/c4-c1").stdout.strip())
+        finally:
+            relay.Run, relay.paths.check_all = orig_run, orig_check
+            relay.LEDGER, relay.NOTIFY_LEDGER = orig_ledger, orig_nl
+            if orig_env is None:
+                os.environ["RELAY_NOTIFY_CONFIG"] = str(Path(tempfile.gettempdir()) / "relay_no_such_notify_config.json")
+            else:
+                os.environ["RELAY_NOTIFY_CONFIG"] = orig_env
+            rm_runs(gid)
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -1827,7 +2077,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff):
+                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff, test_candidates):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()

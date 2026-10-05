@@ -94,6 +94,7 @@ AGY_REVIEW = HERE / "tools" / "agy_review.py"
 
 # ---- C4a（2026-10-05）：實作者可插拔 codex｜claude ------------------------------------------------
 IMPLEMENTERS = ("codex", "claude")
+MAX_CANDIDATES = 3   # C4（2026-10-05）best-of-N 的候選上限，寫死：N 份＝N 倍實作＋N 倍審查額度，成本要事前可見
 IMPL_NAMES = {"codex": "Codex", "claude": "Claude Code"}   # 給人看的名字（log、commit 訊息）
 # Claude 沒有 Codex 的沙箱，所以紅線改成「結構上做不到」：只給讀寫檔工具。沒有 Bash ⇒ 不能 git commit／push、
 # 不能啟動服務、也不能自己跑驗證指令（那本來就是 relay 的事）
@@ -128,6 +129,11 @@ REVIEW_RULES = """你是程式碼審查者，只看 diff 不看實作者的回�
 POLICY_DEFAULTS = {"max_files": 2, "max_lines": 60}
 
 
+def diff_line_count(diff: str) -> int:
+    """diff 的增刪行數（不含 +++／--- 檔頭）。decide_review 的小改動判準與 C4 排名的 diff_stats 共用同一算法。"""
+    return sum(1 for l in diff.splitlines() if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---")))
+
+
 def decide_review(task: dict, changed: list[str], diff: str, verify_failed_any: bool, gate: dict) -> tuple[bool, str]:
     """回 (要不要送審, 理由)。policy=always/never/auto；auto 依序：介面破壞→審、碰核心→審、驗證曾失敗→審、
     小改動（檔數≤max_files 且 diff 行數≤max_lines）→跳過只跑測試、其餘→審。介面變更永遠不套用跳過規則。"""
@@ -145,7 +151,7 @@ def decide_review(task: dict, changed: list[str], diff: str, verify_failed_any: 
         return True, "碰到核心模組：" + ", ".join(hit[:3])
     if verify_failed_any:
         return True, "本任務曾有驗證失敗"
-    lines = sum(1 for l in diff.splitlines() if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---")))
+    lines = diff_line_count(diff)
     lim = {**POLICY_DEFAULTS, **task.get("policy", {})}
     if len(changed) <= lim["max_files"] and lines <= lim["max_lines"]:
         return False, f"小改動（{len(changed)} 檔、{lines} 行）且無介面／核心／驗證失敗訊號 → 跳過審查，只靠測試"
@@ -284,6 +290,9 @@ class State:
     # C5（2026-10-05）：每次換手／跳過一筆 {"round","from","to","reason","ts",…}；reason＝rate_limit（同輪換手）、
     # cooling（本棒已撞過牆而略過）、cooldown（帳本冷卻窗內而略過）。只是紀錄：relay 從不讀它來決定下一棒用誰
     handoffs: list = field(default_factory=list)
+    # C4（2026-10-05）：best-of-N 排名只讀 STATE，所以把排名要用的兩項落檔（單棒也寫，無害）
+    negctl: list = field(default_factory=list)       # 每輪 {"round","ok"}；verify 沒過就沒跑陰性對照，記 ok=True
+    diff_stats: dict = field(default_factory=dict)   # 最後一輪 {"files","lines"}（每輪覆寫）
 
 
 def state_from_dict(d) -> State:
@@ -1316,11 +1325,13 @@ class Run:
             self.state.iface_gate = gate
             verify_failed_any = any(r["exit"] != 0 for r in self.state.verify)
             need_review, why = decide_review(self.t, changed_now, diff, verify_failed_any, gate)
+            self.state.diff_stats = {"files": len(changed_now), "lines": diff_line_count(diff)}
             self.state.review_decisions.append({"round": rnd, "need_review": need_review, "why": why,
                                                 "changed": changed_now, "breaking": sum(len(g["breaking"]) for g in gate.values())})
             self.save()
             self.log(f"審查判準：{'送審' if need_review else '跳過審查'}——{why}", prefix="JUDGE")
             nc_ok, nc_summary = self.negative_control(rnd) if v_ok else (True, "")
+            self.state.negctl.append({"round": rnd, "ok": nc_ok})
             if need_review:
                 r_ok, review_text, _, tool_ok = self.review(rnd, diff)
             else:
@@ -1526,6 +1537,31 @@ class TaskError(ValueError):
     """任務檔不合法，或 resume 的前置檢查不過：main() 印訊息後 exit 3。"""
 
 
+def _check_candidates(task: dict) -> None:
+    """C4（2026-10-05）：candidates 欄位驗證——長度 2～MAX_CANDIDATES，每項 implementer 必填且是單一字串（候選模式不換手），
+    model／effort 選填；每份候選的 id 要合法、worktree 不得等於生產目錄（原本只檢主 worktree）。缺欄位＝一般單棒。"""
+    cands = task.get("candidates")
+    if cands is None:
+        return
+    if not (isinstance(cands, list) and 2 <= len(cands) <= MAX_CANDIDATES):
+        raise TaskError(f"candidates 必須是 2～{MAX_CANDIDATES} 項的清單（成本上限寫死；只想跑一份就拿掉這個欄位）；給的是 {cands!r}")
+    for k, c in enumerate(cands, 1):
+        if not isinstance(c, dict) or set(c) - {"implementer", "model", "effort"}:
+            raise TaskError(f"candidates[{k}] 必須是 {{implementer, model?, effort?}} 物件（給的是 {c!r}）")
+        if not (isinstance(c.get("implementer"), str) and c["implementer"] in IMPLEMENTERS):
+            raise TaskError(f"candidates[{k}].implementer 不合法：{c.get('implementer')!r}（{' / '.join(IMPLEMENTERS)}；候選模式不換手，不接受清單）")
+        if "model" in c and not (isinstance(c["model"], str) and c["model"].strip()):
+            raise TaskError(f"candidates[{k}].model 必須是非空字串")
+        if "effort" in c and not (c["implementer"] == "claude" and c["effort"] in CLAUDE_EFFORTS):
+            raise TaskError(f"candidates[{k}].effort 只有 claude 可用，且只能是 {' / '.join(CLAUDE_EFFORTS)}（給的是 {c['effort']!r}）")
+    prod = task.get("production_dir")
+    for ct in derive_candidate_tasks(task):
+        if not valid_task_id(ct["id"]):
+            raise TaskError(f"候選 id {ct['id']!r} 不合法（task id 太長？候選要加 .cK 後綴）")
+        if prod and Path(ct["worktree"]).resolve() == Path(prod).resolve():
+            raise TaskError(f"候選 {ct['id']} 的 worktree 不得等於生產目錄")
+
+
 def load_task(path: Path) -> dict:
     """讀任務檔＋一般啟動與 resume 共用的驗證（2026-10-05 從 main() 抽出，C6 resume 會重讀任務檔）。
     相對路徑一律相對於 relay.py 所在目錄。"""
@@ -1558,6 +1594,7 @@ def load_task(path: Path) -> dict:
             and len(set(order)) == len(order)):
         raise TaskError(f"implementer 不合法：{impl!r}（{' / '.join(IMPLEMENTERS)}，或不重複的清單如 "
                         f"{json.dumps(list(IMPLEMENTERS))}＝撞牆時依序換手；省略＝codex）")
+    _check_candidates(task)
     cd = task.get("handoff_cooldown_minutes", 0)
     if isinstance(cd, bool) or not isinstance(cd, int) or cd < 0:
         raise TaskError(f"handoff_cooldown_minutes 必須是 ≥0 的整數分鐘（0＝關，預設）；給的是 {cd!r}")
@@ -1576,8 +1613,9 @@ def required_clis(task: dict) -> dict:
     """環境自檢要哪幾支 CLI（C4a，2026-10-05）→ paths.check_all 的 keyword 參數。
     以前一律要 codex＋agy：review.policy=never 也要求裝 agy（與 README 不符）、claude 實作者也要求裝 codex。
     C5（2026-10-05）：implementer 清單裡的每一支都要在——換手的備援要能用，缺了要在開跑前大聲說，不是撞牆時才發現。
-    C4（candidates[*].implementer）落地時在這裡併入。"""
-    impl = set(implementer_order(task))
+    C4（2026-10-05）：有 candidates 時 task 的 implementer 被忽略，改算 candidates[*].implementer。"""
+    cands = task.get("candidates")
+    impl = {c["implementer"] for c in cands if isinstance(c, dict)} if cands else set(implementer_order(task))
     return {"need_codex": "codex" in impl, "need_claude": "claude" in impl,
             "need_agy": task["review"].get("policy", "always") != "never"}
 
@@ -1678,6 +1716,211 @@ def prepare_resume(task_id: str, cli_task: str | None, rounds_arg: int | None) -
     return ResumePlan(task, state, notes, rounds, str(tf.resolve()), snap)
 
 
+# ---- C4（2026-10-05）：best-of-N——同任務多份候選，依序跑完、機器排名，人只看第一名 --------------------------
+REVIEW_RANK = {"approve": 0, "skipped": 1, "changes": 2, "tool_failure": 3, "none": 4}
+CAND_ID_RE = re.compile(r"\.c(\d+)$")
+
+
+def derive_candidate_tasks(task: dict) -> list[dict]:
+    """task（含 candidates）→ 每份候選一個獨立的單棒 task（純函式，不改輸入）。第 k 份：id／branch／worktree 加 -c{k} 後綴
+    （id 用 .c{k}，--status 看得到、--resume 可單獨指定），implementer 一律單一字串——候選模式強制關閉換手（C5），
+    不然兩份候選會在同一輪互相「換成對方的 CLI」而失去比較意義。model／effort 有給才覆蓋，沒給就沿用 task 本身的設定。
+    刪 candidates、加 _group 標回群組 id。"""
+    out = []
+    for k, cand in enumerate(task["candidates"], 1):
+        ct = copy.deepcopy(task)
+        impl = cand["implementer"]
+        ct.pop("candidates", None)
+        ct["id"], ct["_group"] = f"{task['id']}.c{k}", task["id"]
+        ct["branch"], ct["worktree"] = f"{task['branch']}-c{k}", f"{task['worktree']}-c{k}"
+        ct["implementer"] = impl
+        if cand.get("model"):
+            ct["implementer_models"] = {**(ct.get("implementer_models") or {}), impl: cand["model"]}
+        if cand.get("effort"):
+            ct["implementer_effort"] = {**(ct.get("implementer_effort") or {}), "claude": cand["effort"]}
+        out.append(ct)
+    return out
+
+
+def candidate_review(s: dict) -> str:
+    """一份候選的審查結果 → skipped／tool_failure／approve／changes／none。只看最後一輪（前幾輪的退回已被後面蓋過）。"""
+    rnd = s.get("round") or 0
+    ds = [d for d in (s.get("review_decisions") or []) if isinstance(d, dict) and d.get("round") == rnd]
+    if any(d.get("need_review") is False for d in ds):
+        return "skipped"
+    rv = [c for c in (s.get("calls") or []) if isinstance(c, dict) and c.get("role") == "reviewer" and c.get("round") == rnd]
+    if rv and rv[-1].get("ok") is False:
+        return "tool_failure"
+    ap = [d for d in ds if "approved" in d]
+    if ap:
+        return "approve" if ap[-1]["approved"] else "changes"
+    return "none"
+
+
+def rank_candidates(states: list[dict]) -> list[dict]:
+    """各候選的 STATE（dict）→ 排名列（第一名在最前）。純函式、只讀 STATE：不碰 worktree／branch。
+    STATE 沒有的資訊用保守預設；run_group 會替 STATE 補 _verify_total（沒跑到 verify 時的分母）。
+    排序鍵見規格 §7b，另在收斂之後加「aborted 墊後」（中止的候選即使 verify 全過也不可用，不能排在未收斂但完整的候選前面）：
+    收斂 > 非 aborted > verify 過的條數 > negctl > 審查 > 介面破壞 > 未申報 > diff 行數 > 輪數 > 秒數 > cand 序。"""
+    rows = []
+    for s in states:
+        rnd = s.get("round") or 0
+        ver = [v for v in (s.get("verify") or []) if isinstance(v, dict) and v.get("round") == rnd]
+        v_pass = sum(1 for v in ver if v.get("exit") == 0)
+        v_total = len(ver) if ver else int(s.get("_verify_total") or 0)
+        nc = [n for n in (s.get("negctl") or []) if isinstance(n, dict) and n.get("round") == rnd]
+        verdict = s.get("verdict") or ""
+        if s.get("phase") == "aborted" or not verdict:
+            verdict = "aborted" if s.get("phase") == "aborted" else "incomplete"
+        ap = [d for d in (s.get("review_decisions") or []) if isinstance(d, dict) and d.get("round") == rnd and "approved" in d]
+        m = CAND_ID_RE.search(s.get("task_id") or "")
+        rows.append({
+            "cand": int(m.group(1)) if m else 0, "implementer": s.get("implementer") or "?", "verdict": verdict,
+            "verify_pass": v_pass, "verify_total": v_total, "negctl_ok": all(n.get("ok") for n in nc),
+            "review": candidate_review(s),
+            "breaking": sum(len((g or {}).get("breaking", [])) for g in (s.get("iface_gate") or {}).values()),
+            "unreported": len(ap[-1].get("unreported") or []) if ap else 0,
+            "diff_lines": int((s.get("diff_stats") or {}).get("lines", 0)), "rounds": rnd,
+            "seconds": round(sum(c.get("seconds") or 0 for c in (s.get("calls") or []) if isinstance(c, dict)), 1),
+            "branch": s.get("branch") or "", "commit": s.get("commit") or ""})
+    rows.sort(key=lambda r: (r["verdict"] != "converged", r["verdict"] == "aborted", -r["verify_pass"], not r["negctl_ok"], REVIEW_RANK[r["review"]],
+                             r["breaking"], r["unreported"], r["diff_lines"], r["rounds"], r["seconds"], r["cand"]))
+    return rows
+
+
+def render_ranking(gid: str, rows: list[dict], tasks: dict[int, dict]) -> str:
+    """RANKING.md 內容。清理指令只是印給人的文字（relay 紅線：從不代執行 worktree remove／branch -D）。"""
+    first = rows[0]
+    L = [f"# {gid} best-of-{len(rows)} 排名", "",
+         "機器已跑完每份候選的 verify＋閘門＋審查再排名；人只需要看第一名。排序：收斂 > verify 過的條數 > 陰性對照 > 審查 > "
+         "介面破壞數 > 未申報數 > diff 行數 > 輪數 > 秒數 > 候選序。", "",
+         "| 名次 | 候選 | 實作者 | verdict | verify | negctl | review | breaking | unreported | diff行 | 輪 | 秒 | 分支@commit |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for i, r in enumerate(rows, 1):
+        L.append(f"| {i} | c{r['cand']} | {r['implementer']} | {r['verdict']} | {r['verify_pass']}/{r['verify_total']} | "
+                 f"{'ok' if r['negctl_ok'] else 'fail'} | {r['review']} | {r['breaking']} | {r['unreported']} | {r['diff_lines']} | "
+                 f"{r['rounds']} | {r['seconds']} | {r['branch'] or '-'}@{r['commit'] or '-'} |")
+    L.append("")
+    if first["verdict"] == "converged":
+        L.append(f"第一名：c{first['cand']} → 分支 `{first['branch']}` @ `{first['commit']}`；"
+                 f"人只看 `runs/{gid}.c{first['cand']}/HANDOFF.md`。")
+    else:
+        L.append(f"沒有候選收斂（排最前的是 c{first['cand']}，verdict={first['verdict']}）；"
+                 f"先讀 `runs/{gid}.c{first['cand']}/HANDOFF.md` 看卡點。")
+    L += ["", "其餘候選的 worktree 與分支都保留。清理指令（relay **不**代執行，人確認不要了再自己跑）：", "", "```"]
+    for r in rows[1:]:
+        ct = tasks[r["cand"]]
+        L += [f'git -C "{ct["repo"]}" worktree remove "{ct["worktree"]}"', f'git -C "{ct["repo"]}" branch -D "{ct["branch"]}"']
+    L += ["```", "", f"第一名（c{first['cand']}）合併後，它的 worktree 與分支同理由人清理。", ""]
+    return "\n".join(L)
+
+
+def _notify_group(gid: str, kind: str, info: dict, a) -> str:
+    """群組結束時的推播：整個群組只發這一則（候選一律 no_notify）。失敗只記 log，不改 exit code（同 Run.notify）。"""
+    if getattr(a, "dry_run", False) or getattr(a, "no_notify", False):
+        return ""
+    try:
+        result = notify.notify(kind, gid, info, config_path=notify_config_path(), ledger_path=NOTIFY_LEDGER,
+                               lock_path=LOCKS / "notify.lock")
+    except Exception as e:  # ponytail: 同 Run.notify，連 notify 自己的 bug 也吞掉；代價是推播可能靜默沒發，log 留一行
+        result = f"推播例外：{type(e).__name__}"
+    if result != "推播關閉":
+        emit("RELAY", result)
+    return result
+
+
+def run_group(task: dict, a) -> int:
+    """best-of-N：依序跑每份候選（決策 D7：不平行，整個群組只佔 1 個並行名額），全跑完讀各自的 STATE 排名，
+    寫 runs/<id>/RANKING.md 與 GROUP.json，推播一則。一份候選中止（RuntimeError／其他例外）只標那一份 aborted，
+    繼續下一份。排名只讀 STATE、不動任何 worktree／branch；清理指令只印不執行。exit：第一名收斂 0，否則 2。
+    dry-run：每份候選各走自己的 dry，只印計畫，不取鎖、不寫 RANKING／GROUP。
+    ponytail: 候選之間完全串列，N 份的牆鐘時間是 N 倍；升級路徑＝改成多個名額並行跑（需先實測並行的額度與本機狀態）。"""
+    gid, dry = task["id"], bool(getattr(a, "dry_run", False))
+    cts = derive_candidate_tasks(task)
+    tmap = {k: ct for k, ct in enumerate(cts, 1)}
+    emit("RELAY", f"best-of-{len(cts)}：{gid} 依序跑 {len(cts)} 份候選（成本＝{len(cts)} 倍實作＋{len(cts)} 倍審查額度；不平行、不換手）")
+    if "implementer" in task:
+        emit("RELAY", "task 的 implementer 欄位在候選模式下被忽略（各候選用自己的 implementer）")
+    for k, ct in tmap.items():
+        mdl = (ct.get("implementer_models") or {}).get(ct["implementer"], "")
+        emit("RELAY", f"  c{k}：{ct['id']}　{ct['implementer']}{('／' + mdl) if mdl else ''}　分支 {ct['branch']}　worktree {ct['worktree']}")
+    gdir = HERE / "runs" / gid
+    src = str(Path(a.task).resolve()) if getattr(a, "task", None) else ""
+    try:
+        locks = nullcontext() if dry else acquire_run_locks(task, queue=bool(getattr(a, "queue", False)))
+    except runlock.LockBusy as e:
+        print("relay 拒跑：", e, file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        return 130
+    t0, skipped, tfiles = time.monotonic(), set(), {}
+    with locks:
+        if not dry:
+            gdir.mkdir(parents=True, exist_ok=True)
+            (gdir / "RANKING.md").unlink(missing_ok=True)  # 上次的排名不可冒充這次的
+            # 候選的任務檔落在群組目錄：--resume <id>.cK 要靠它（原任務檔有 candidates，載入會被當群組拒絕）
+            for k, ct in tmap.items():
+                tf = gdir / f"cand_{k}.task.json"
+                tf.write_text(json.dumps(ct, ensure_ascii=False, indent=1), encoding="utf-8")
+                tfiles[k] = str(tf)
+            (gdir / "GROUP.json").write_text(json.dumps({"id": gid, "state": "running", "candidates": [c["id"] for c in cts]},
+                                                       ensure_ascii=False, indent=1), encoding="utf-8")
+        for k, ct in tmap.items():
+            try:
+                lk = nullcontext() if dry else acquire_run_locks(ct, queue=False, take_slot=False)
+            except runlock.LockBusy as e:
+                skipped.add(ct["id"])
+                emit("RELAY", f"候選 {ct['id']} 略過（不跑、不讀它舊的 STATE）：{e}")
+                continue
+            with lk:
+                run = None
+                try:
+                    run = Run(ct, dry, no_notify=True, task_file=tfiles.get(k, src))
+                    if not dry:
+                        run.note_interrupted_previous()
+                    emit("RELAY", f"=== 候選 c{k}/{len(cts)}：{ct['id']} ===")
+                    rc = run.run()
+                    emit("RELAY", f"候選 {ct['id']} 結束（exit {rc}）")
+                except KeyboardInterrupt:
+                    if run:
+                        run.abort("使用者中斷", notify=False)
+                    if not dry:
+                        (gdir / "GROUP.json").write_text(json.dumps({"id": gid, "state": "interrupted"}), encoding="utf-8")
+                    return 130
+                except RuntimeError as e:  # 規格外改動、worktree／prebuild 失敗…：只中止這一份
+                    emit("RELAY", f"候選 {ct['id']} 中止：{e}")
+                    if run:
+                        run.abort(str(e), notify=False)
+                except Exception as e:
+                    emit("RELAY", f"候選 {ct['id']} 崩潰：{type(e).__name__}: {e}")
+                    if run:
+                        run.abort(f"{type(e).__name__}: {e}", notify=False)
+                    traceback.print_exc()
+        if dry:
+            emit("RELAY", "[dry] 群組只印計畫，不寫 RANKING.md")
+            return 0
+        states = []
+        for k, ct in tmap.items():
+            s = None if ct["id"] in skipped else _read_state(HERE / "runs" / ct["id"] / "STATE.json")
+            s = {"task_id": ct["id"], "phase": "aborted", "abort_reason": "未執行"} if s is None else dict(s)
+            s["task_id"] = ct["id"]
+            s["implementer"] = s.get("implementer") or ct["implementer"]
+            s["_verify_total"] = len(ct.get("verify", []))
+            states.append(s)
+        rows = rank_candidates(states)
+        (gdir / "RANKING.md").write_text(render_ranking(gid, rows, tmap), encoding="utf-8")
+        first, n = rows[0], len(rows)
+        converged = first["verdict"] == "converged"
+        info = {"minutes": int((time.monotonic() - t0) // 60), "group": {
+            "n": n, "cand": first["cand"], "implementer": first["implementer"], "verdict": first["verdict"]}}
+        res = _notify_group(gid, "ready_to_merge" if converged else "escalate", info, a)
+        (gdir / "GROUP.json").write_text(json.dumps({"id": gid, "state": "done", "candidates": [c["id"] for c in cts],
+                                                    "ranking": rows, "first": first["cand"], "notified": res}, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+        emit("RELAY", f"排名完成：第一名 c{first['cand']}（{first['implementer']}，{first['verdict']}）；讀 runs/{gid}/RANKING.md")
+        return 0 if converged else 2
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("task", nargs="?")
@@ -1719,6 +1962,8 @@ def main(argv=None) -> int:
         if missing:
             print("環境缺少 CLI,無法動工:\n  - " + "\n  - ".join(missing), file=sys.stderr)
             return 3
+    if task.get("candidates") and not plan:  # C4：best-of-N 群組（resume 帶 candidates 的任務已在 prepare_resume 被拒）
+        return run_group(task, a)
     if plan:
         run = Run(task, a.dry_run, task_file=plan.task_file, no_notify=a.no_notify, resume_state=plan.state)
     else:

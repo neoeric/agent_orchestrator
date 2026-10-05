@@ -70,6 +70,7 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `implementer` | `codex`（預設）或 `claude`；**可寫清單**如 `["codex", "claude"]`＝撞牆（judge 判 `rate_limit`）時依序換手（見「換手」）。其他值（含寫錯、空清單、重複）啟動時就 exit 3，不再靜默用 Codex；清單裡每一支都會在開跑前自檢。prompt 一律經 stdin 送，沒有命令列長度上限 |
 | `implementer_models` | 選填 `{"claude": "sonnet", "codex": "<model>"}`：各實作者用的模型；沒給＝該 CLI 自己的預設（claude 跟著你的 Claude Code 設定走，可能是最貴的那個） |
 | `implementer_effort` | 選填 `{"claude": "high"}`（`low`／`medium`／`high`／`xhigh`／`max`）；只接受 claude，寫錯 exit 3 |
+| `candidates` | 選填，best-of-N：`[{"implementer":"codex"},{"implementer":"claude","model":"sonnet"}]`，2～3 項（寫死上限），每項 `implementer` 必填且是單一字串、`model`／`effort`（effort 只給 claude）選填；有此欄時 task 的 `implementer` 被忽略；見「同任務多候選」 |
 | `handoff_cooldown_minutes` | 選填，整數分鐘，預設 `0`（關）。>0 時，帳本裡這段時間內回過 `rate_limit` 的實作者，本棒一開始就先略過（只是建議：清單裡全都在窗內就照用第一個）；見「換手」 |
 | `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
@@ -272,6 +273,29 @@ relay 不代為 checkout／reset，也**絕不從頭重跑**——狀態對不�
   `rate_limit`，最壞是多燒一次另一支 CLI（且只在你寫了清單時）。**第一次遇到時**，`[JUDGE]` 那行會印原始輸出的路徑：
   請人工確認它真的是額度限制，再照 `fixtures/README.md` 收成 `fixtures/<cli>_rate_limit.*` 並補判定器契約測試（收了之後提示就不再出現）。
 
+## 同任務多候選（best-of-N，選用）
+
+難題、而且規格已完全指定時，同一個任務交給不同實作者／模型各做一份，**機器先把每份的 verify＋閘門＋審查都跑完再排名，人只看第一名**
+（對照「多 agent 並排、人逐一比較」的做法，這裡把比較的工作先交給機器）。
+
+```json
+"candidates": [{"implementer": "codex"}, {"implementer": "claude", "model": "sonnet", "effort": "high"}]
+```
+
+- **只認明確宣告**：不會因為第一輪 verify 失敗就自動分叉（本機資料顯示那樣約 24% 的棒會多燒一倍額度，其中一半本來就會自己收斂）。
+- **成本寫死、事前可見**：最多 3 份（`MAX_CANDIDATES`）。**N 份＝N 倍實作＋N 倍審查額度**，沒有任何折扣。
+- **依序跑、不平行**：整個群組只佔 1 個並行名額，額度消耗平緩；牆鐘時間是 N 倍。每份候選是獨立的一棒：
+  id `<id>.c1`／`.c2`…、分支 `<branch>-c1`…、worktree `<worktree>-c1`…（各自的 `runs/<id>.cK/`，`--status` 看得到）。
+  候選模式**不換手**（每份的 `implementer` 只能是單一字串）；沒給 `model`／`effort` 就沿用 task 本身的 `implementer_models`／`implementer_effort`。
+- **一份中止不影響其他份**：規格外改動等中止只標那一份 `aborted`，其餘照跑；候選自己都不推播，整個群組結束只推一則。
+- **排名**只讀各候選的 `STATE.json`，不動任何 worktree／branch。依序比較（小者優先）：收斂與否 → 是否中止 → 最後一輪 verify 過的條數（多者優先）→
+  陰性對照 → 審查（approve＜skipped＜changes＜tool_failure＜none）→ 介面破壞數 → 審查者點出的未申報數 → diff 行數 → 輪數 → 秒數 → 候選序。
+- **產出**：`runs/<id>/RANKING.md`（排名表＋第一名的分支／commit）與 `runs/<id>/GROUP.json`。exit 0＝第一名收斂；2＝沒有候選收斂（仍排名）。
+  推播（kind `ready_to_merge` 或 `escalate`）第 1 行寫第一名是誰，第 2 行叫你讀 `RANKING.md`，只看第一名的 `HANDOFF.md`。
+- **清理是人做**：`RANKING.md` 會列出其餘候選的 `git worktree remove`／`git branch -D` 指令，**relay 只印、不執行**；確認不要了再自己跑。
+- `--resume <id>` 對群組 id 會拒絕（exit 3）；要接續請指定候選 id（`--resume <id>.c2`，任務檔是 `runs/<id>/cand_2.task.json`），那是一般單棒。
+- `--dry-run`：每份候選各印自己的計畫，不寫 `RANKING.md`。
+
 ## 需要人時才推播（選用）
 
 一棒常跑十幾分鐘到一小時，人不會一直盯著終端機。relay 可以在「需要你動手」時推播一則；**沒有設定檔就整個關閉**（預設零行為改變）。relay 不內建任何通道，只呼叫你指定的外部指令、經 **stdin（UTF-8）** 交訊息，日後換通道只改設定檔。
@@ -359,7 +383,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，68 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手，245 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手／同任務多候選，289 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
@@ -462,5 +486,6 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 ## 還沒做
 
 - **審查者換手**：agy 撞牆只會停下推播，不會換別家審。
+- **best-of-N 只支援明確宣告**：不會因第一輪失敗自動分叉；候選依序跑、不平行。
 - **批次啟動器**：並行要自己開兩個行程（每個行程自己守 RELAY_MAX_PARALLEL 名額），沒有一個指令跑一批的 launcher。
 - 帳本只用於換手冷卻（預設關），沒有做額度預算。
