@@ -19,16 +19,19 @@
   PYTHONUTF8=1 python relay.py tasks/<task>.json --dry-run  # 只印計畫不呼叫任何 CLI（紀錄寫到 runs/<id>.dry/）
   PYTHONUTF8=1 python relay.py tasks/<task>.json --queue    # 並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊
   PYTHONUTF8=1 python relay.py --status [--all]             # 所有棒的階段、輪次、耗時、是否等人
+  PYTHONUTF8=1 python relay.py --resume <task_id> [--rounds N]  # 人工意見回灌：讀 runs/<id>/human_notes.md 接續下一輪
 離開碼：0＝收斂並已 commit；2＝不收斂／被擋，已寫 HANDOFF 給人；3＝參數／環境錯、被鎖擋下拒跑、或例外中止
 （STATE 記 aborted）；130＝Ctrl-C。
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,7 +39,7 @@ import time
 import traceback
 import unicodedata
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, field, asdict
+from dataclasses import MISSING, dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -205,6 +208,37 @@ class State:
     pid: int = 0              # 只供人看；判活一律看任務鎖（見 tools/runlock.py）
     abort_reason: str = ""
     notified: dict = field(default_factory=dict)  # C2：這一棒發過的推播 {"kind","result","ts"}；沒發過是 {}
+    # 2026-10-05（C6）：--resume 要接得上的欄位。以前上一輪的發現只是區域變數、commit 只記一顆，resume 會遺失
+    last_feedback: str = ""   # 最後一輪組好、尚未解決的發現（收斂時清空）；resume 時附給實作者當參考
+    resumed: list = field(default_factory=list)   # 每次 resume 一筆 {"ts","from_round","first_round","rounds","notes_sha256",…}
+    commits: list = field(default_factory=list)   # relay 在這個 branch 上疊過的每一顆 commit；commit 欄＝最新一顆
+
+
+def state_from_dict(d) -> State:
+    """STATE.json 的內容 → State（C6 resume 用）。未知鍵略過、缺的新欄位用預設值（舊 STATE 讀得進來）；
+    有給的欄位型別要和預設值同型，否則丟 ValueError——損壞的 STATE 要大聲停下，不可帶著錯的輪次接著跑。
+    ponytail：只驗頂層欄位型別，不驗 calls／verify 等清單的內部形狀（那些只給人看與 HANDOFF 用）。"""
+    if not isinstance(d, dict):
+        raise ValueError("最上層不是 JSON 物件")
+    kw = {}
+    for name, f in State.__dataclass_fields__.items():
+        if name not in d:
+            continue
+        v = d[name]
+        if f.default is not MISSING:
+            want = type(f.default)
+        elif f.default_factory is not MISSING:
+            want = type(f.default_factory())
+        else:
+            want = str  # task_id
+        if not isinstance(v, want) or (want is int and isinstance(v, bool)):
+            raise ValueError(f"欄位 {name} 型別不對（應為 {want.__name__}，實為 {type(v).__name__}）")
+        kw[name] = copy.deepcopy(v)  # 不和輸入共用清單：main 拿到鎖後還要拿原 dict 比對 STATE 有沒有被改過
+    if not kw.get("task_id"):
+        raise ValueError("缺 task_id")
+    if kw.get("round", 0) < 0:
+        raise ValueError("round 為負數")
+    return State(**kw)
 
 
 def now() -> str:
@@ -432,7 +466,8 @@ def _read_state(path: Path) -> dict | None:
 
 
 class Run:
-    def __init__(self, task: dict, dry: bool, *, task_file: str = "", no_notify: bool = False):
+    def __init__(self, task: dict, dry: bool, *, task_file: str = "", no_notify: bool = False,
+                 resume_state: State | None = None):
         self.t = task
         self.dry = dry
         self.no_notify = no_notify  # 人坐在終端機前跑時用（--no-notify）
@@ -441,8 +476,17 @@ class Run:
         self.dir = HERE / "runs" / (task["id"] + (".dry" if dry else ""))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.prev_state = _read_state(self.dir / "STATE.json")  # 上一次留下的 STATE：認出「前次沒收尾」用
-        self.state = State(task_id=task["id"], started=now(), title=task.get("title", ""), task_file=task_file,
-                           max_rounds=int(task.get("max_rounds", 2)), pid=os.getpid())
+        if resume_state is not None:
+            # C6（2026-10-05）：resume 沿用前次 STATE（保留 started、輪次、calls…），不新建——新建會在第一次 save 蓋掉舊紀錄
+            self.state = resume_state
+            self.state.pid = os.getpid()
+            self.state.title = task.get("title", self.state.title)
+            self.state.task_file = task_file or self.state.task_file
+        else:
+            self.state = State(task_id=task["id"], started=now(), title=task.get("title", ""), task_file=task_file,
+                               max_rounds=int(task.get("max_rounds", 2)), pid=os.getpid())
+        self.resuming = False   # start_resume() 之後為 True
+        self.review_extra = ""  # resume 時附在審查核對條件後面的人工追加要求
         self.wt = task["worktree"]
         self.repo = task["repo"]
 
@@ -454,6 +498,8 @@ class Run:
         (self.dir / "STATE.json").write_text(json.dumps(asdict(self.state), ensure_ascii=False, indent=1), encoding="utf-8")
 
     def write_current(self, text: str) -> None:
+        if self.resuming:  # C6：接手的人第一眼就知道這不是原始那一棒
+            text = text.replace("# CURRENT\n", f"# CURRENT（人工意見回灌，第 {len(self.state.resumed)} 次 resume）\n", 1)
         (self.dir / "CURRENT.md").write_text(text, encoding="utf-8")
 
     def record(self, rec: CallRecord) -> None:
@@ -485,8 +531,8 @@ class Run:
             return
         self._notified = True
         try:
-            started = _parse_ts(self.state.started)
-            minutes = int((datetime.now(timezone.utc) - started).total_seconds() // 60) if started else None
+            started = _parse_ts(_segment_start(asdict(self.state)))  # C6：resume 的棒只算這一次接續的耗時
+            minutes =int((datetime.now(timezone.utc) - started).total_seconds() // 60) if started else None
             info = {"round": self.state.round, "max_rounds": self.state.max_rounds, "commit": self.state.commit,
                     "branch": self.state.branch, "minutes": minutes, **info}
             result = notify.notify(kind, self.t["id"], info, config_path=notify_config_path(), ledger_path=NOTIFY_LEDGER,
@@ -507,15 +553,51 @@ class Run:
 
     def note_interrupted_previous(self) -> None:
         """拿到任務鎖之後呼叫（2026-10-05，C3）：上一次的 STATE 停在非終態＝那個行程沒收尾就不在了
-        （被硬殺、關機…）。OS 已釋放它的鎖、這裡拿得到就是證明；只負責把「認出殘留」記下來，本次照常從頭跑。"""
+        （被硬殺、關機…）。OS 已釋放它的鎖、這裡拿得到就是證明；只負責把「認出殘留」記下來，本次照常從頭跑
+        （C6 resume 則是從那份 STATE 接續）。"""
         p = self.prev_state
         if p and p.get("phase") not in TERMINAL_PHASES:
             self.log(f"前一次行程（pid {p.get('pid') or '?'}）停在「{p.get('phase')}」（{p.get('updated') or '?'}）沒有收尾；"
-                     "它的任務鎖已無人持有＝行程已不在，本次從頭重跑")
+                     "它的任務鎖已無人持有＝行程已不在，" + ("本次從它的 STATE 接續（resume）" if self.resuming else "本次從頭重跑"))
+
+    def start_resume(self, notes: str, rounds: int) -> dict:
+        """C6（2026-10-05）：拿到鎖、確認 STATE 沒被別人動過之後呼叫；回傳給 run() 的參數。
+        先保存紀錄再改狀態：HANDOFF.md 複製成 HANDOFF.r{round}.md（已存在就不蓋）；human_notes.md 改名成
+        human_notes.r{first}.md——之後的編輯不會被這次誤用，下次 resume 也不會重用舊意見。dry-run 兩者都不做。"""
+        st = self.state
+        first = st.round + 1
+        if not self.dry:
+            h, h_old = self.dir / "HANDOFF.md", self.dir / f"HANDOFF.r{st.round}.md"
+            if h.is_file() and not h_old.exists():
+                shutil.copy2(h, h_old)
+            (self.dir / "human_notes.md").rename(self.dir / f"human_notes.r{first}.md")  # 目標已存在時 main 先擋下
+        if st.commit and not st.commits:  # C6 之前的 STATE 只有 commit 一欄
+            st.commits = [st.commit]
+        st.resumed.append({"ts": now(), "from_round": st.round, "first_round": first, "rounds": rounds,
+                           "prev_phase": st.phase, "notes_sha256": hashlib.sha256(notes.encode("utf-8")).hexdigest(),
+                           "notes_chars": len(notes)})
+        st.abort_reason, st.verdict = "", ""
+        st.max_rounds = first + rounds - 1  # --status 與推播的「N/M 輪」：M＝這次最多跑到第幾輪
+        self.resuming = True
+        # 審查者也要拿到人工意見：否則人要求的改動會被依舊條件判「不通過」而無限退回
+        self.review_extra = "\n\n【人工追加要求（優先於上列條件；衝突時以此為準）】\n" + notes
+        fb = "【人工審查意見（最高優先；與規格或先前審查意見衝突時以此為準）】\n" + notes
+        if st.last_feedback:
+            fb += "\n\n【上一輪未解決的發現（參考）】\n" + st.last_feedback
+        self.save()
+        return {"start_round": first, "rounds": rounds, "initial_feedback": fb, "resume": True}
 
     # ---- 1. worktree ---------------------------------------------------------
-    def prepare(self) -> None:
+    def prepare(self, resume: bool = False) -> None:
         t = self.t
+        if resume:
+            # C6（2026-10-05）：worktree 已由前次備妥（main 已驗過存在、且在任務分支上）；不建 worktree、不跑 prebuild。
+            # 需要重建產物時人自己跑，或開新棒。base_commit 沿用前次（審查累積 diff 的基準），前次沒記到才補。
+            if not self.state.base_commit and not self.dry:
+                self.state.base_commit = git(self.repo, "rev-parse", "--short", t["base_branch"]).stdout.strip()
+            self.state.branch, self.state.worktree = t["branch"], self.wt
+            self.log(f"{'[dry] ' if self.dry else ''}resume：沿用 worktree {self.wt}（{t['branch']}），不重建、不跑 prebuild")
+            return
         if self.dry:
             self.log(f"[dry] worktree {self.wt} ← {t['base_branch']} 新分支 {t['branch']}")
             return
@@ -547,14 +629,24 @@ class Run:
         self.save("prepared")
 
     # ---- 2. 實作者 -----------------------------------------------------------
-    def implement(self, rnd: int, feedback: str) -> tuple[bool, str, dict | None]:
+    def impl_prompt(self, rnd: int, feedback: str) -> str:
+        """組實作者 prompt 並落檔 impl_r{rnd}_prompt.md（2026-10-05 從 implement 抽出：測試替身與真實作共用同一份組法）。"""
         spec = Path(self.t["spec_file"]).read_text(encoding="utf-8")
         prompt = IMPL_RULES + "\n【規格】\n" + spec
         if feedback:
-            prompt += "\n\n【上一輪審查／驗證的發現，請逐條修正後再回報】\n" + feedback
+            # C6：resume 第一輪的 feedback 自帶「【人工審查意見…】」標題，不再套「上一輪審查」的帽子
+            head = "" if feedback.startswith("【人工審查意見") else "【上一輪審查／驗證的發現，請逐條修正後再回報】\n"
+            prompt += "\n\n" + head + feedback
+        (self.dir / f"impl_r{rnd}_prompt.md").write_text(prompt, encoding="utf-8")
+        if len(prompt) > 30000:
+            # C6：prompt 目前走 argv（Windows 命令列上限 32,767 字元）；人工意見很長時先大聲說，失敗了才知道為什麼
+            self.log(f"⚠ 實作者 prompt {len(prompt)} 字元，超過 30,000：命令列可能放不下（上限約 32K），請精簡 human_notes 或規格")
+        return prompt
+
+    def implement(self, rnd: int, feedback: str) -> tuple[bool, str, dict | None]:
+        prompt = self.impl_prompt(rnd, feedback)
         out_last = self.dir / f"impl_r{rnd}_last_message.md"
         so, se, ex = self.dir / f"impl_r{rnd}.stdout.txt", self.dir / f"impl_r{rnd}.stderr.txt", self.dir / f"impl_r{rnd}.exit.txt"
-        (self.dir / f"impl_r{rnd}_prompt.md").write_text(prompt, encoding="utf-8")
         if self.dry:
             self.log(f"[dry] codex exec（round {rnd}，prompt {len(prompt)} 字）")
             return True, "(dry)", None
@@ -634,7 +726,8 @@ class Run:
         return all_ok, "\n".join(lines)
 
     # ---- 4. 審查 -------------------------------------------------------------
-    def diff_for_review(self) -> str:
+    def diff_for_review(self, base: str = "HEAD") -> str:
+        """base 預設 HEAD；C6（2026-10-05）resume 已 commit 過的棒時傳任務的分岔點，審查者才看得到整個任務的累積改動。"""
         # 未追蹤但不被 ignore 的新檔用 intent-to-add 納入 diff（不改 index 內容）
         git(self.wt, "add", "--intent-to-add", "--all")
         # 🔴 2026-09-23 修（gw-layout-p2b round 1 假退回）：原本是 `git diff`（index vs 工作樹），
@@ -644,13 +737,27 @@ class Run:
         #    改成對 HEAD 比並開 -M（rename 偵測），暫存與否都呈現 R 列；驗證＝2026-09-23 臨時 repo
         #    兩情境實測（deleted=0/rename=0 → deleted=1/rename=1）。（原指 memory 9/23 條，該條 2026-10-05
         #    整理時已刪，以本註解為準。）
-        d = git(self.wt, "diff", "-M", "HEAD", "--", ".", ":(exclude)_refactor/*").stdout
+        d = git(self.wt, "diff", "-M", base, "--", ".", ":(exclude)_refactor/*").stdout
         return d
 
-    def review(self, rnd: int, diff: str) -> tuple[bool, str, dict | None]:
-        instr = REVIEW_RULES + "\n【核對條件】\n" + Path(self.t["review"]["instructions_file"]).read_text(encoding="utf-8")
+    def review_base(self) -> str:
+        """C6：已 commit 過的棒 resume 時，審查 diff 的基準＝state.base_commit 與 HEAD 的 merge-base。
+        通常就是 base_commit；分支是沿用既有的（prepare 的「已存在就掛上」）時 base_commit 可能比分岔點新，
+        直接比會把 base 那邊的新 commit 顯示成反向改動。merge-base 失敗才退回 base_commit。"""
+        r = git(self.wt, "merge-base", self.state.base_commit, "HEAD")
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else self.state.base_commit
+
+    def review_inputs(self, rnd: int, diff: str) -> tuple[Path, Path, Path]:
+        """寫審查指令與 diff 檔，回 (instr, diff, out) 路徑（2026-10-05 從 review 抽出：測試替身與真審查共用）。
+        C6：resume 時核對條件後面追加人工要求（self.review_extra）。"""
+        instr = (REVIEW_RULES + "\n【核對條件】\n" + Path(self.t["review"]["instructions_file"]).read_text(encoding="utf-8")
+                 + self.review_extra)
         instr_f, diff_f, out_f = self.dir / f"review_r{rnd}_instr.txt", self.dir / f"review_r{rnd}_diff.txt", self.dir / f"review_r{rnd}_agy.json"
         instr_f.write_text(instr, encoding="utf-8"); diff_f.write_text(diff, encoding="utf-8")
+        return instr_f, diff_f, out_f
+
+    def review(self, rnd: int, diff: str) -> tuple[bool, str, dict | None]:
+        instr_f, diff_f, out_f = self.review_inputs(rnd, diff)
         if self.dry:
             self.log(f"[dry] agy review（round {rnd}，diff {len(diff)} 字）")
             return True, "(dry)", None, True
@@ -735,12 +842,21 @@ class Run:
             u = c["usage"] or {}
             usage_lines.append(f"- round {c['round']} {c['role']}: {'OK' if c['ok'] else 'FAIL'} {c['seconds']}s, "
                                f"input_total={u.get('input_tokens_total')} output={u.get('output_tokens')}")
+        resumed = ""
+        if self.state.resumed:  # C6：上一版 HANDOFF 已存成 HANDOFF.r{N}.md，這裡說清楚這份是第幾次接續
+            r0 = self.state.resumed[-1]
+            resumed = (f"人工意見回灌第 {len(self.state.resumed)} 次：本次從第 {r0.get('first_round')} 輪起"
+                       f"（意見原文 `runs/{self.t['id']}/human_notes.r{r0.get('first_round')}.md`）；"
+                       f"relay 在此分支的 commit：{', '.join(self.state.commits) or '（無）'}。\n")
+        next_step = ("人：審過 HANDOFF 後合併到 base branch、依 repo 紀律部署；編排器不合併不重啟。" if status == "done" else
+                     "人：讀下方審查／驗證輸出決定修法或放棄；worktree 與分支保留。要補一句意見再跑：寫 "
+                     f"`runs/{self.t['id']}/human_notes.md` 後 `relay.py --resume {self.t['id']}`（輪次接續、不重建 worktree）。")
         text = f"""# HANDOFF — {self.t['id']}（{status}，{now()}）
 
 ## 1. 完成了什麼
 {'（未收斂，見卡點）' if status != 'done' else self.t.get('title', self.t['id'])}
 分支 `{self.state.branch}` @ `{self.state.commit or '未 commit'}`，worktree `{self.wt}`，base `{self.state.base_commit}`。
-
+{resumed}
 ## 2. 改了哪些檔
 {chr(10).join('- ' + p for p in paths) if paths else '- （無）'}
 
@@ -758,7 +874,7 @@ class Run:
 {blocker or '無'}
 
 ## 6. 建議下一步
-{'人：審過 HANDOFF 後合併到 base branch、依 repo 紀律部署；編排器不合併不重啟。' if status == 'done' else '人：讀下方審查／驗證輸出決定修法或放棄；worktree 與分支保留。'}
+{next_step}
 
 ## 審查判準與簽章閘門
 {chr(10).join('- round ' + str(d.get('round')) + '：' + ('送審' if d.get('need_review') else '跳過') + '——' + str(d.get('why')) for d in self.state.review_decisions if 'need_review' in d) or '- （無）'}
@@ -781,17 +897,26 @@ class Run:
         (self.dir / "HANDOFF.md").write_text(text, encoding="utf-8")
 
     # ---- 主流程 --------------------------------------------------------------
-    def run(self) -> int:
+    def run(self, start_round: int = 1, rounds: int | None = None, initial_feedback: str = "", resume: bool = False) -> int:
+        """跑一棒。C6（2026-10-05）一般化：resume 時從 start_round 接續編號（r3、r4…，不覆蓋舊紀錄），
+        第一輪的 feedback＝人工意見（＋上一輪未解決的發現），不建 worktree、不跑 prebuild。"""
         self.log(f"任務 {self.t['id']}：{self.t.get('title', '')}")
-        self.prepare()
-        feedback, impl_report, verify_summary, review_text, paths = "", "", "", "", []
-        for rnd in range(1, int(self.t.get("max_rounds", 2)) + 1):
+        rounds = int(self.t.get("max_rounds", 2)) if rounds is None else rounds
+        last = start_round + rounds - 1
+        if resume:
+            self.log(f"人工意見回灌（第 {len(self.state.resumed)} 次 resume）：從第 {start_round} 輪接續，最多到第 {last} 輪")
+        self.prepare(resume=resume)
+        # D11：已 commit 過的棒 resume → 在同一 branch 疊新 commit；審查看整個任務的累積 diff，commit 只收增量
+        review_base = self.review_base() if (resume and self.state.commit and not self.dry) else ""
+        feedback, impl_report, verify_summary, review_text, paths = initial_feedback, "", "", "", []
+        for rnd in range(start_round, last + 1):
             self.state.round = rnd
-            self.write_current(f"# CURRENT\n\n任務 {self.t['id']} round {rnd}/{self.t.get('max_rounds', 2)}：實作中。worktree `{self.wt}`。\n")
+            self.write_current(f"# CURRENT\n\n任務 {self.t['id']} round {rnd}/{last}：實作中。worktree `{self.wt}`。\n")
             self.save("implement")
             ok, impl_report, _ = self.implement(rnd, feedback)
             if not ok and not self.dry:
                 feedback = "實作者的 CLI 呼叫沒有正常結束（判定器：" + self.state.calls[-1]["reason"] + "）。請重做規格。"
+                self.state.last_feedback = feedback
                 self.log("實作者呼叫失敗，下一輪重試")
                 continue
             self.save("verify")
@@ -799,9 +924,13 @@ class Run:
             self.save("review")
             diff = self.diff_for_review() if not self.dry else "(dry)"
             if not self.dry and not diff.strip():
-                feedback = "worktree 沒有任何改動。請照規格實際修改檔案。"
+                feedback = ("worktree 相對上一顆 commit 沒有任何新改動。請照人工審查意見實際修改檔案。" if review_base
+                            else "worktree 沒有任何改動。請照規格實際修改檔案。")
+                self.state.last_feedback = feedback
                 self.log("沒有 diff，下一輪")
                 continue
+            if review_base:
+                diff = self.diff_for_review(review_base)
             # P2：簽章閘門 + 難易度判準
             git(self.wt, "reset", "-q")
             changed_now = self.worktree_changes()
@@ -818,6 +947,16 @@ class Run:
                 r_ok, review_text, _, tool_ok = self.review(rnd, diff)
             else:
                 r_ok, review_text, tool_ok = True, f"（依判準跳過審查：{why}）", True
+            fb = []
+            if not v_ok:
+                fb.append("【驗證未過】\n" + verify_summary)
+            if not nc_ok:
+                fb.append("【陰性對照未過：新斷言沒抓到被注入的違規】\n" + nc_summary)
+            if tool_ok and not r_ok:  # 工具故障時的「退回」不是審查意見，不餵給實作者
+                fb.append("【審查判定需修改，原文】\n" + review_text)
+            feedback = "\n\n".join(fb)
+            self.state.last_feedback = feedback  # C6：落檔，resume 時當「上一輪未解決的發現」；收斂時為空
+            self.save()
             if not tool_ok:
                 # 審查工具故障：停下來給人，不開下一輪（實作沒問題時再跑一輪只是燒錢）
                 self.state.verdict = "review_tool_failure"
@@ -826,14 +965,6 @@ class Run:
             if v_ok and nc_ok and r_ok:
                 self.state.verdict = "converged"
                 break
-            fb = []
-            if not v_ok:
-                fb.append("【驗證未過】\n" + verify_summary)
-            if not nc_ok:
-                fb.append("【陰性對照未過：新斷言沒抓到被注入的違規】\n" + nc_summary)
-            if not r_ok:
-                fb.append("【審查判定需修改，原文】\n" + review_text)
-            feedback = "\n\n".join(fb)
             self.log(f"round {rnd} 未收斂（verify={'ok' if v_ok else 'fail'} negctl={'ok' if nc_ok else 'fail'} review={'ok' if r_ok else 'fail'}）")
         else:
             self.state.verdict = "escalate"
@@ -842,9 +973,11 @@ class Run:
             self.log("[dry] 結束")
             return 0
         if self.state.verdict == "converged":
-            paths = self.changed_paths()
-            msg = f"{self.t.get('title', self.t['id'])}\n\n（編排器 relay.py：Codex 實作、agy 審查、驗證指令全過；task {self.t['id']}）\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n"
+            paths = self.changed_paths()  # 一律對 HEAD：resume 已 commit 過的棒時只收增量
+            again = f"；人工意見回灌第 {len(self.state.resumed)} 次" if self.resuming else ""
+            msg = f"{self.t.get('title', self.t['id'])}\n\n（編排器 relay.py：Codex 實作、agy 審查、驗證指令全過；task {self.t['id']}{again}）\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n"
             self.state.commit = self.commit(paths, msg)
+            self.state.commits.append(self.state.commit)  # 不改寫既有 commit：同一 branch 上疊新的一顆
             self.save("done")
             self.handoff("done", impl_report, verify_summary, review_text, paths, "")
             self.write_current(f"# CURRENT\n\n任務 {self.t['id']} 已收斂並 commit `{self.state.commit}` 於 `{self.state.branch}`。\n下一步是人：審 HANDOFF.md → 合併 → 部署。編排器到此為止。\n")
@@ -858,7 +991,8 @@ class Run:
             paths = [f"（{e}）"]
         if self.state.verdict == "review_tool_failure":
             blocker = (f"審查工具故障（round {self.state.round}：agy_review 沒有回傳 JSON／子行程崩潰）。實作與驗證結果見上；"
-                       "修好 tools/agy_review.py 後重跑 relay，或人工審 review_r*_diff.txt；worktree 改動保留、未 commit。")
+                       "修好 tools/agy_review.py 後重跑 relay，或人工審 review_r*_diff.txt，或寫 human_notes.md（例如「請照原樣，"
+                       "只需重新審查」）後 `relay.py --resume` 接續；worktree 改動保留、未 commit。")
         else:
             blocker = f"{self.state.round} 輪未收斂（驗證或審查不過），已停止；worktree 保留供人接手。"
         self.handoff("escalate", impl_report, verify_summary, review_text, paths, blocker)
@@ -900,6 +1034,14 @@ def _parse_ts(s) -> datetime | None:
         return None
 
 
+def _segment_start(s: dict):
+    """這一次執行的開始時間：有 resume 紀錄就用最後一次 resume 的 ts，否則 started（C6，2026-10-05）。
+    started 保留原始開跑時間；耗時若從它算，會把「棒停著等人」的幾小時到幾天也算進去。"""
+    r = s.get("resumed")
+    last = r[-1] if isinstance(r, list) and r else None  # --status 也會讀到壞 STATE：形狀不對就退回 started
+    return last.get("ts") if isinstance(last, dict) and last.get("ts") else s.get("started")
+
+
 def _fmt_minutes(seconds: float) -> str:
     m = max(int(seconds // 60), 0)
     return f"{m}分" if m < 60 else f"{m // 60}時{m % 60}分"
@@ -927,12 +1069,12 @@ def _waiting(s: dict, alive: bool) -> str:
 
 def status_rows(states: list[dict], alive: dict[str, bool], now: datetime) -> list[dict]:
     """STATE 清單 → 總表列，依 updated 由新到舊。alive[task_id]＝任務鎖有沒有人持有；now 要帶時區。
-    耗時：活著＝now − started；否則＝updated − started。"""
+    耗時：活著＝now − started；否則＝updated − started（resume 過的棒 started 取最後一次 resume，見 _segment_start）。"""
     rows = []
     for s in states:
         tid, bad = s.get("task_id", "?"), bool(s.get("_bad"))
         is_alive = bool(alive.get(tid))
-        started, updated = _parse_ts(s.get("started")), _parse_ts(s.get("updated"))
+        started, updated = _parse_ts(_segment_start(s)), _parse_ts(s.get("updated"))
         end = now if is_alive else updated
         rows.append({
             "task": tid,
@@ -975,6 +1117,133 @@ def status_report(limit: int | None) -> str:
     return render_status(status_rows(states, alive, datetime.now().astimezone()), limit)
 
 
+class TaskError(ValueError):
+    """任務檔不合法，或 resume 的前置檢查不過：main() 印訊息後 exit 3。"""
+
+
+def load_task(path: Path) -> dict:
+    """讀任務檔＋一般啟動與 resume 共用的驗證（2026-10-05 從 main() 抽出，C6 resume 會重讀任務檔）。
+    相對路徑一律相對於 relay.py 所在目錄。"""
+    try:
+        task = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise TaskError(f"讀不了任務檔 {path}：{type(e).__name__}: {e}") from None
+    if not isinstance(task, dict):
+        raise TaskError("任務檔最上層必須是 JSON 物件")
+    for k in ("id", "repo", "base_branch", "branch", "worktree", "spec_file", "verify", "review"):
+        if k not in task:
+            raise TaskError(f"task 缺欄位 {k}")
+    if not valid_task_id(task["id"]):
+        raise TaskError(f"task id 不合法：{task['id']!r}（英數或底線開頭，其後英數 . _ -，最長 100 字，不可以 . 或 .dry 結尾）")
+    if not isinstance(task["review"], dict) or "instructions_file" not in task["review"]:
+        raise TaskError("task 缺欄位 review.instructions_file")
+    for k in ("spec_file",):
+        if not Path(task[k]).is_absolute():
+            task[k] = str(HERE / task[k])
+    if not Path(task["review"]["instructions_file"]).is_absolute():
+        task["review"]["instructions_file"] = str(HERE / task["review"]["instructions_file"])
+    prod = task.get("production_dir")
+    if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
+        raise TaskError("worktree 不得等於生產目錄")
+    return task
+
+
+# ---- C6（2026-10-05）：人工意見回灌 relay.py --resume <task_id> --------------------------------------
+ROUND_FILE_RE = re.compile(r"(impl|verify|review)_r(\d+)[._]")
+
+
+@dataclass
+class ResumePlan:
+    task: dict
+    state: State
+    notes: str
+    rounds: int
+    task_file: str
+    snapshot: dict  # 前置檢查讀到的 STATE 原文：拿到鎖後再比一次，確認沒被別的行程改過
+
+
+def resolve_task_file(cli: str | None, state_task_file: str, task_id: str, here: Path | None = None) -> Path | None:
+    """resume 用哪份任務檔：命令列 > STATE 記的 task_file > <here>/tasks/<id>.json；都找不到回 None。
+    命令列有給就只認它——給錯路徑要大聲說，不默默換成別份。"""
+    if cli:
+        return Path(cli) if Path(cli).is_file() else None
+    for c in (state_task_file, (HERE if here is None else here) / "tasks" / f"{task_id}.json"):
+        if c and Path(c).is_file():
+            return Path(c)
+    return None
+
+
+def prepare_resume(task_id: str, cli_task: str | None, rounds_arg: int | None) -> ResumePlan:
+    """resume 的前置檢查，只讀不寫；任一不過丟 TaskError（訊息說明怎麼補救）。
+    取捨原則：狀態對不上就停下讓人看，絕不靜默從頭重跑；不做任何破壞性 git 操作（不 checkout／reset／rebase）。
+    「同一任務正在跑」由 main 取任務鎖時擋（C3）；STATE 停在非終態但沒人持有鎖＝崩潰殘留，拿到鎖後記一行警告照常接續。"""
+    if not valid_task_id(task_id):
+        raise TaskError(f"task id 不合法：{task_id!r}")
+    rd = HERE / "runs" / task_id
+    group_msg = f"{task_id} 是 best-of-N 群組：群組不能 resume，請指定候選 id（例如 {task_id}.c1）"
+    if (rd / "GROUP.json").exists():
+        raise TaskError(group_msg)
+    if not (rd / "STATE.json").is_file():
+        raise TaskError(f"找不到 runs/{task_id}/STATE.json：這棒沒跑過或 id 打錯（resume 只接續跑過的棒；新任務用 relay.py <task.json>）")
+    snap = _read_state(rd / "STATE.json")
+    try:
+        if snap is None:
+            raise ValueError("不是合法的 JSON 物件")
+        state = state_from_dict(snap)
+    except ValueError as e:
+        raise TaskError(f"runs/{task_id}/STATE.json 損壞（{e}）：請人工檢查；relay 不會從頭重跑") from None
+    if state.task_id != task_id:
+        raise TaskError(f"STATE.json 的 task_id 是 {state.task_id!r}，與 --resume {task_id!r} 不符")
+    tf = resolve_task_file(cli_task, state.task_file, task_id)
+    if tf is None:
+        where = f"命令列給的 {cli_task} 不存在" if cli_task else f"STATE 記的 task_file 與 tasks/{task_id}.json 都不在"
+        raise TaskError(f"找不到任務檔（{where}）；請用 relay.py <task.json> --resume {task_id}")
+    task = load_task(tf)
+    if task["id"] != task_id:
+        raise TaskError(f"任務檔 {tf} 的 id 是 {task['id']!r}，與 --resume {task_id!r} 不符")
+    if task.get("candidates"):
+        raise TaskError(group_msg)
+    wt = task["worktree"]
+    if state.worktree and _path_key(state.worktree) != _path_key(wt):
+        raise TaskError(f"STATE 記的 worktree {state.worktree} 與任務檔的 {wt} 不同：換 worktree 就是另一棒，請開新棒")
+    if state.branch and state.branch != task["branch"]:
+        raise TaskError(f"STATE 記的分支 {state.branch} 與任務檔的 {task['branch']} 不同：換分支就是另一棒，請開新棒")
+    if not Path(wt).is_dir():
+        raise TaskError(f"worktree 不存在：{wt}。resume 不重建 worktree（重建＝從頭重跑）；要從頭請用 relay.py <task.json> 另開一棒")
+    top = git(wt, "rev-parse", "--show-toplevel")
+    try:  # samefile：git 回的是正斜線長路徑，任務檔可能寫短路徑／反斜線，字串比會誤判
+        same = top.returncode == 0 and os.path.samefile(top.stdout.strip(), wt)
+    except OSError:
+        same = False
+    if not same:  # 例如一般資料夾剛好在別的 repo 底下：分支檢查會量到外層 repo，必須先擋
+        raise TaskError(f"{wt} 不是 git worktree 的根目錄（{(top.stderr or top.stdout).strip()[-200:]}）；請人工確認")
+    head = git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if head != task["branch"]:
+        raise TaskError(f"worktree 目前在 {head!r}，不是任務分支 {task['branch']!r}；relay 不代為 checkout，請人工確認後再 resume")
+    if state.commit and git(wt, "merge-base", "--is-ancestor", state.commit, "HEAD").returncode != 0:
+        raise TaskError(f"分支 {task['branch']} 上找不到上次的 commit {state.commit}（被 reset／rebase 過？）；relay 不改寫歷史，請人工確認")
+    np = rd / "human_notes.md"
+    if not np.is_file():
+        raise TaskError(f"沒有 runs/{task_id}/human_notes.md：把要給實作者與審查者的意見寫進這個檔再 resume")
+    try:
+        notes = np.read_text(encoding="utf-8-sig").strip()  # utf-8-sig：記事本存檔帶的 BOM 去掉
+    except (OSError, UnicodeDecodeError) as e:
+        raise TaskError(f"讀不了 runs/{task_id}/human_notes.md（請存成 UTF-8）：{type(e).__name__}") from None
+    if not notes:
+        raise TaskError(f"runs/{task_id}/human_notes.md 是空的（只有空白／BOM）：寫下意見再 resume")
+    rounds = int(task.get("max_rounds", 2)) if rounds_arg is None else rounds_arg
+    if rounds < 1:
+        raise TaskError(f"--rounds 必須 ≥ 1（給的是 {rounds}）")
+    first = state.round + 1
+    if (rd / f"human_notes.r{first}.md").exists():
+        raise TaskError(f"runs/{task_id}/human_notes.r{first}.md 已存在（上次 resume 中途中止？）：確認內容後移走或併進 human_notes.md 再 resume")
+    seen = [int(m.group(2)) for p in rd.iterdir() if (m := ROUND_FILE_RE.match(p.name))]
+    if seen and max(seen) > state.round:
+        raise TaskError(f"runs/{task_id}/ 已有第 {max(seen)} 輪的紀錄，但 STATE 的 round 是 {state.round}：狀態對不上，"
+                        "請人工檢查（resume 不覆蓋舊紀錄）")
+    return ResumePlan(task, state, notes, rounds, str(tf.resolve()), snap)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("task", nargs="?")
@@ -984,6 +1253,8 @@ def main(argv=None) -> int:
     ap.add_argument("--all", action="store_true", help="配 --status：列出全部紀錄")
     ap.add_argument("--no-notify", action="store_true", help="這一棒不推播（人坐在終端機前跑時用）")
     ap.add_argument("--queue", action="store_true", help="並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊等，不直接拒跑")
+    ap.add_argument("--resume", metavar="TASK_ID", help="人工意見回灌：讀 runs/<id>/human_notes.md，從上次的 STATE 接續下一輪")
+    ap.add_argument("--rounds", type=int, help="配 --resume：這次最多跑幾輪（預設＝任務的 max_rounds）")
     a = ap.parse_args(argv)
     if a.ledger:
         for cli, t in ledger_totals().items():
@@ -993,49 +1264,65 @@ def main(argv=None) -> int:
     if a.status:
         print(status_report(None if a.all else STATUS_LIMIT))
         return 0
-    if not a.task:
+    if a.rounds is not None and not a.resume:
+        print("--rounds 只能配 --resume 使用（一般棒的輪數寫在任務檔 max_rounds）", file=sys.stderr)
+        return 3
+    if not a.task and not a.resume:
         ap.error("缺 task 檔")
     if not a.dry_run:
         missing = paths.check_all()
         if missing:
             print("環境缺少 CLI,無法動工:\n  - " + "\n  - ".join(missing), file=sys.stderr)
             return 3
-    task = json.loads(Path(a.task).read_text(encoding="utf-8"))
-    for k in ("id", "repo", "base_branch", "branch", "worktree", "spec_file", "verify", "review"):
-        if k not in task:
-            print(f"task 缺欄位 {k}", file=sys.stderr)
+    if a.resume:
+        try:
+            plan = prepare_resume(a.resume, a.task, a.rounds)
+        except TaskError as e:
+            print("relay 拒絕 resume：", e, file=sys.stderr)
             return 3
-    if not valid_task_id(task["id"]):
-        print(f"task id 不合法：{task['id']!r}（英數或底線開頭，其後英數 . _ -，最長 100 字，不可以 . 或 .dry 結尾）",
-              file=sys.stderr)
-        return 3
-    # 相對路徑一律相對於 relay.py 所在目錄
-    for k in ("spec_file",):
-        if not Path(task[k]).is_absolute():
-            task[k] = str(HERE / task[k])
-    if not Path(task["review"]["instructions_file"]).is_absolute():
-        task["review"]["instructions_file"] = str(HERE / task["review"]["instructions_file"])
-    prod = task.get("production_dir")
-    if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
-        print("worktree 不得等於生產目錄", file=sys.stderr)
+        run = Run(plan.task, a.dry_run, task_file=plan.task_file, no_notify=a.no_notify, resume_state=plan.state)
+        return _execute(run, plan.task, a, plan)
+    try:
+        task = load_task(Path(a.task))
+    except TaskError as e:
+        print(e, file=sys.stderr)
         return 3
     run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()), no_notify=a.no_notify)
+    return _execute(run, task, a)
+
+
+def _execute(run: Run, task: dict, a, plan: ResumePlan | None = None) -> int:
+    """取鎖 → 跑棒 → 例外落檔（一般與 resume 共用；2026-10-05 從 main() 抽出）。"""
     # 2026-10-05（C3）：取鎖與跑棒分兩段——取鎖階段被擋時 runs/<id>/ 可能正被別的行程寫，不可寫 STATE；
     # 跑棒階段的任何例外都在鎖還握著時落檔（C1：中止要寫進 STATE，總表才不會說謊）。dry-run 不取任何鎖。
+    # C6：resume 排隊時不寫 queued——STATE 要保持前置檢查讀到的原樣，拿到鎖後才比對得出有沒有被別人動過。
+    # ponytail：代價是 resume 排隊中 --status 顯示「跑中」而非「排隊中」。
+    on_wait = None if plan else (lambda: run.save("queued"))
     try:
-        locks = nullcontext() if a.dry_run else acquire_run_locks(task, queue=a.queue, on_wait=lambda: run.save("queued"))
+        locks = nullcontext() if a.dry_run else acquire_run_locks(task, queue=a.queue, on_wait=on_wait)
     except runlock.LockBusy as e:
         print("relay 拒跑：", e, file=sys.stderr)
         return 3
     except KeyboardInterrupt:
-        if run.state.phase == "queued":  # 排隊中按 Ctrl-C：queued 是自己寫的，改記中止，總表才不會顯示「中斷？」
+        if not plan and run.state.phase == "queued":  # 排隊中按 Ctrl-C：queued 是自己寫的，改記中止，總表才不會顯示「中斷？」
             run.abort("使用者中斷（排隊中）", notify=False)
         return 130
     with locks:
+        kw: dict = {}
+        if plan:
+            if not a.dry_run and _read_state(HERE / "runs" / task["id"] / "STATE.json") != plan.snapshot:
+                print("relay 拒絕 resume：STATE.json 在檢查之後被改動（另一個 relay 剛跑過這棒？）；請重看 HANDOFF 後再 resume",
+                      file=sys.stderr)
+                return 3
+            try:
+                kw = run.start_resume(plan.notes, plan.rounds)
+            except OSError as e:
+                print(f"relay 拒絕 resume：保存上一輪紀錄失敗（{type(e).__name__}: {e}）", file=sys.stderr)
+                return 3
         try:
             if not a.dry_run:
                 run.note_interrupted_previous()
-            return run.run()
+            return run.run(**kw)
         except KeyboardInterrupt:
             run.abort("使用者中斷", notify=False)
             return 130

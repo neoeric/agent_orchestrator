@@ -54,7 +54,8 @@ def compose(kind: str, task_id: str, info: dict) -> str:
         l2 = f"下一步：讀 runs/{task_id}/HANDOFF.md 後自行合併 {i.get('branch') or '該分支'}（relay 不合併）"
     elif kind == "escalate":
         l1 = f"【relay】{task_id} 未收斂：{i.get('round', '?')}/{i.get('max_rounds', '?')} 輪用完"
-        l2 = "下一步：讀 HANDOFF.md 第 5 節卡點，決定修規格或放棄；worktree 保留"
+        # 2026-10-05（C6）：人看完卡點最常想「補一句意見再跑」，第 2 行直接給接續的指令（不必整棒重開）
+        l2 = f"下一步：讀 HANDOFF.md 第 5 節卡點；可寫 runs/{task_id}/human_notes.md 後 relay.py --resume {task_id}，或修規格／放棄"
     elif kind == "review_tool_failure":
         l1 = f"【relay】{task_id} 審查工具故障（{i.get('failure_class') or '未分類'}）：實作與驗證已完成、未 commit"
         l2 = "下一步：修好審查工具（常見＝登入過期）後照 README 補審，不必重跑整棒"

@@ -84,6 +84,7 @@ PYTHONUTF8=1 python relay.py tasks/my-task.json
 PYTHONUTF8=1 python relay.py tasks/my-task.json --dry-run   # 只印計畫，不呼叫任何 CLI（寫到 runs/<id>.dry/）
 PYTHONUTF8=1 python relay.py tasks/my-task.json --queue     # 並行名額滿了就排隊（見「並行」）
 PYTHONUTF8=1 python relay.py --status   # 所有棒的階段、輪次、耗時、是否等人（--all 看全部）
+PYTHONUTF8=1 python relay.py --resume my-task [--rounds N]   # 寫好 runs/my-task/human_notes.md 後接續下一輪（見「人工意見回灌」）
 PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 ```
 
@@ -143,8 +144,10 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 | 檔案 | 內容 |
 |---|---|
 | `CURRENT.md` | 接手的人第一眼看這份 |
-| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage；含中止原因，relay 被例外中止時階段記為 `aborted` |
+| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage；含中止原因，relay 被例外中止時階段記為 `aborted`；最後一輪未解決的發現（`last_feedback`）、每次 resume（`resumed`）、relay 疊過的每顆 commit（`commits`） |
 | `HANDOFF.md` | 六欄交接簿，含實作者與審查者原文 |
+| `human_notes.md` | 你寫的人工意見，`--resume` 用（見「人工意見回灌」）；用過改名成 `human_notes.r{N}.md` |
+| `HANDOFF.r{N}.md` | resume 前那一版 HANDOFF 的備份（N＝當時停在第幾輪） |
 | `relay.log` | 完整時序 |
 | `impl_r*` / `review_r*` / `verify_r*` | 每輪的 prompt、diff、審查指令、驗證輸出 |
 | `runs/usage_ledger.jsonl` | 跨任務帳本，每次呼叫一行（task／role／cli／usage／秒數／failure_class） |
@@ -189,6 +192,50 @@ foreach ($id in "task-a", "task-b") {
 python relay.py --status
 ```
 
+## 人工意見回灌（--resume）
+
+看完一棒的 HANDOFF 想補一句意見再跑，不必整棒重開（重開＝從第 1 輪重來、多燒一輪實作）：
+
+```text
+# 1. 把意見寫進 runs/<id>/human_notes.md（UTF-8；記事本存檔帶的 BOM 會自動去掉）
+# 2. 接續
+PYTHONUTF8=1 python relay.py --resume my-task                     # 最多再跑 max_rounds 輪
+PYTHONUTF8=1 python relay.py --resume my-task --rounds 1          # 只再跑 1 輪
+PYTHONUTF8=1 python relay.py tasks/my-task.json --resume my-task  # STATE 記的任務檔不在了時，明給任務檔
+```
+
+`human_notes.md` 直接寫你要的改動，一條一行即可，例如：
+
+```text
+1. 函式名改成 parse_rows，呼叫端一起改。
+2. 錯誤訊息改成中文。
+3. 不要動 tests/ 底下的測試資料。
+```
+
+- **意見同時給實作者與審查者，而且優先**：實作者第一輪拿到「【人工審查意見（最高優先…）】」＋上一輪未解決的發現；
+  審查者在這次 resume 的每一輪，核對條件後面都多一段「【人工追加要求（優先於上列條件…）】」——否則你要的改動會被依舊條件判「不通過」而一直退回。
+- **輪次接續編號**：上次停在第 2 輪就從第 3 輪開始（`impl_r3_*`、`review_r3_*`…），舊紀錄不覆蓋；`--status` 的輪次顯示成 `3/4`（4＝這次最多跑到第幾輪），耗時從這次 resume 起算。
+- **已收斂（已 commit）的棒也能接續**：在同一 branch 上**疊一顆新 commit**，不改寫、不 reset 既有 commit，也不 merge；
+  審查者看的是**整個任務的累積 diff**（對任務起點比），commit 只收這次的增量。`STATE.json` 的 `commits` 記每一顆，`commit` 是最新一顆。
+- **要改範圍先改任務檔**：resume 會重讀任務檔；要動 `allowed_paths` 以外的檔，先改 JSON 再 resume（沒有另外的旗標）。
+- **不重建 worktree、不跑 `prebuild`**：沿用上次的 worktree 與裡面未 commit 的改動；需要重建產物時自己跑，或開新棒。
+- **用過的意見會改名**：開跑前 `human_notes.md` 改名成 `human_notes.r{N}.md`（N＝這次的第一輪），`HANDOFF.md` 備份成 `HANDOFF.r{上次輪次}.md`。
+  之後的編輯不會被這次誤用，下次 resume 也不會重用舊意見。**resume 中途又中止時**，要重試請把 `human_notes.r{N}.md` 改回 `human_notes.md`。
+- 鎖與名額同一般棒：同一任務正在跑就拒絕，受 `RELAY_MAX_PARALLEL` 管，可加 `--queue`（resume 排隊中 `--status` 顯示「跑中」）。
+  推播沿用一般出口；`CURRENT.md` 標題會標「人工意見回灌，第 N 次 resume」。
+- `--dry-run --resume <id>`：會讀 notes、計畫寫到 `runs/<id>.dry/`，不改名、不動真實紀錄。
+
+**會拒跑（exit 3，不改任何檔）**：沒有 `STATE.json` 或它損壞、找不到任務檔、`human_notes.md` 不存在或只有空白、
+worktree 不存在、worktree 不在任務分支上、分支上找不到上次的 commit（被 reset／rebase 過）、STATE 記的 worktree／分支與任務檔不同、
+`runs/<id>/` 裡有比 STATE 更新的輪次紀錄、`human_notes.r{N}.md` 已存在、best-of-N 群組 id。
+relay 不代為 checkout／reset，也**絕不從頭重跑**——狀態對不上就停下讓人看。
+
+限制：
+
+- `review.policy=auto` 時，任務曾有驗證失敗（含 resume 之前的輪次）就一定送審。保守、可接受。
+- 從 `aborted` 接續（例如實作者動了規格外的檔）：worktree 裡可能還留著那些改動，請先自己處理，或在 notes 裡要求還原；relay 不代為 `git checkout`。
+- 實作者 prompt 目前走命令列（Windows 上限約 32K 字元）；notes 很長、prompt 超過 30,000 字元時 `relay.log` 會先警告。
+
 ## 需要人時才推播（選用）
 
 一棒常跑十幾分鐘到一小時，人不會一直盯著終端機。relay 可以在「需要你動手」時推播一則；**沒有設定檔就整個關閉**（預設零行為改變）。relay 不內建任何通道，只呼叫你指定的外部指令、經 **stdin（UTF-8）** 交訊息，日後換通道只改設定檔。
@@ -198,7 +245,7 @@ python relay.py --status
 | kind | 時機 | 第 1 行（單獨成立）|
 |---|---|---|
 | `ready_to_merge` | 收斂、已 commit，等你審後合併 | `【relay】<任務> 待合併：第 N 輪收斂，commit <hash>` |
-| `escalate` | 輪數用完仍未收斂 | `【relay】<任務> 未收斂：N/M 輪用完` |
+| `escalate` | 輪數用完仍未收斂（第 2 行提示可寫 `human_notes.md` 後 `--resume`） | `【relay】<任務> 未收斂：N/M 輪用完` |
 | `review_tool_failure` | 審查工具故障，實作與驗證已完成、未 commit | `【relay】<任務> 審查工具故障（<類別>）：…` |
 | `rate_limit` | CLI 回 rate_limit 撞牆 | `【relay】<任務> 撞牆停下：<cli> 回 rate_limit` |
 | `aborted` | 其他例外中止 | `【relay】<任務> 中止：<原因前 60 字>` |
@@ -276,7 +323,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本，138 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌，175 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
@@ -372,7 +419,7 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
   或把測試／文件的 diff 拆開送審，別讓塊數到 4。`review:` 那行 `len` 個位數＝這個症狀，不是審查通過。
 - **agy 登入過期時 relay 只會停下升給人**（`review_tool_failure`，`stderr` 是 `Authentication required`），worktree 改動保留但不 commit。
   重登入後**不必重跑整棒**（會再燒一輪 Codex）：直接 `python tools\agy_review.py --instructions runs\<id>\review_r1_instr.txt --diff runs\<id>\review_r1_diff.txt --out ...`
-  補審即可；HANDOFF 不會自動更新，結果要人記。
+  補審即可；HANDOFF 不會自動更新，結果要人記。或修好後寫 `human_notes.md`（例如「請照原樣，只需重新審查」）用 `--resume` 接續，HANDOFF 會自動更新。
 - **commit 前判改動用內容比對**（2026-10-05）：只差行尾（CRLF↔LF）的檔視為沒改、不 commit、不觸發 `allowed_paths` 中止（autocrlf 下 `status` 會把它標成 ` M`）；
   中文檔名以 `-z` 讀取。同一檔「內容也改了」照常 commit。
 

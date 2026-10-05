@@ -1,5 +1,5 @@
 """_test_relay.py — relay 的純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本、改動判定、
-陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）。不呼叫任何 AI CLI。
+陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）、人工意見回灌 --resume（C6）。不呼叫任何 AI CLI。
 
 跑法：PYTHONUTF8=1 python _test_relay.py   （exit 0＝全過）
 """
@@ -899,6 +899,318 @@ def test_notify_telegram() -> None:
         nt._post = orig_post
 
 
+class ScriptedRun(relay.Run):
+    """規格 §12 共用測試骨架（2026-10-05，C6 起用）：implement／verify／review／negative_control 依腳本回傳，
+    不呼叫任何 CLI。prompt 與審查指令沿用真的組法（impl_prompt／review_inputs），才驗得到兩個角色實際拿到什麼。
+    script＝{"impl": [{"write": {相對路徑: 內容}}…], "verify": [bool…], "review": [(approved, 原文)…]}，每次呼叫 pop 一筆。"""
+
+    def __init__(self, task, script, **kw):
+        super().__init__(task, dry=False, **kw)
+        self.script = script
+        self.calls_log: list[dict] = []
+
+    def implement(self, rnd, feedback, *a, **kw):
+        step = self.script["impl"].pop(0)
+        prompt = self.impl_prompt(rnd, feedback)
+        self.calls_log.append({"role": "impl", "round": rnd, "feedback": feedback, "prompt": prompt})
+        for name, text in step.get("write", {}).items():
+            Path(self.wt, name).write_bytes(text.encode("utf-8"))
+        ok = step.get("ok", True)
+        self.record(relay.CallRecord("implementer", rnd, ok, "scripted", 0, 0.0, None, "", cli="codex",
+                                     failure_class=step.get("failure_class")))
+        return ok, f"（腳本實作者第 {rnd} 輪）", None
+
+    def verify(self, rnd):
+        ok = self.script["verify"].pop(0)
+        self.state.verify.append({"round": rnd, "name": "v", "exit": 0 if ok else 1, "seconds": 0.0, "tail": ""})
+        self.save()
+        return ok, f"- v: {'PASS' if ok else 'FAIL'}"
+
+    def review(self, rnd, diff):
+        approved, text = self.script["review"].pop(0)
+        instr_f, _, _ = self.review_inputs(rnd, diff)
+        self.calls_log.append({"role": "review", "round": rnd, "instr": instr_f.read_text(encoding="utf-8"), "diff": diff})
+        self.record(relay.CallRecord("reviewer", rnd, True, "scripted", 0, 0.0, None, "", cli="agy"))
+        self.state.review_decisions.append({"round": rnd, "structured": True, "approved": approved, "unreported": [], "checks": []})
+        self.save()
+        return approved, text, None, True
+
+    def negative_control(self, rnd):
+        return True, ""
+
+
+@contextlib.contextmanager
+def scripted_main(script: dict, made: list):
+    """main() 裡 new 出來的 Run 換成 ScriptedRun（made 收集實例供檢查）；環境自檢換成「什麼都不缺」。"""
+    orig_run, orig_check = relay.Run, relay.paths.check_all
+
+    def factory(task, dry, **kw):
+        assert not dry, "ScriptedRun 不跑 dry-run"
+        r = ScriptedRun(task, script, **kw)
+        made.append(r)
+        return r
+
+    relay.Run, relay.paths.check_all = factory, (lambda: [])
+    try:
+        yield
+    finally:
+        relay.Run, relay.paths.check_all = orig_run, orig_check
+
+
+def test_resume() -> None:
+    """C6（2026-10-05）：relay.py --resume。escalate／已收斂後接續、拒跑條件（不改任何檔）、dry-run、STATE 相容。
+    全程 ScriptedRun（不呼叫 CLI）、帳本與鎖指暫存、推播設定指到不存在的路徑；臨時 repo 的 autocrlf 在 local 明設。"""
+    import hashlib
+    import subprocess
+    from datetime import datetime, timedelta, timezone
+    from tools import notify
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def mk_repo(d: Path, tid: str, **extra) -> tuple[Path, Path]:
+        """臨時 repo＝worktree（main 一顆 commit，切到 feat/c6），任務檔放 repo 外。"""
+        wt = d / "repo"
+        wt.mkdir(parents=True)
+        g(wt, "init", "-q", "-b", "main"); g(wt, "config", "user.email", "t@t"); g(wt, "config", "user.name", "t")
+        g(wt, "config", "core.autocrlf", "false")
+        (wt / "a.py").write_bytes(b"x = 0\n")
+        g(wt, "add", "-A"); g(wt, "commit", "-qm", "base"); g(wt, "checkout", "-q", "-b", "feat/c6")
+        (d / "spec.md").write_text("把 x 改掉", encoding="utf-8")
+        (d / "review.md").write_text("1. x 有改", encoding="utf-8")
+        task = {"id": tid, "title": "c6 測試", "repo": str(wt), "base_branch": "main", "branch": "feat/c6", "worktree": str(wt),
+                "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
+                "review": {"policy": "always", "instructions_file": str(d / "review.md")},
+                "allowed_paths": ["a.py"], "max_rounds": 2, **extra}
+        tf = d / "task.json"
+        tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+        return wt, tf
+
+    def call(argv: list[str]) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = relay.main(argv)
+        return rc, err.getvalue()
+
+    def snap(rd: Path, wt) -> tuple:
+        """runs/<id>/ 每個檔的 bytes＋worktree 的 HEAD 與 status：拒跑前後必須一模一樣。"""
+        files = {p.relative_to(rd).as_posix(): p.read_bytes() for p in rd.rglob("*") if p.is_file()} if rd.exists() else None
+        gs = (g(wt, "rev-parse", "HEAD").stdout, g(wt, "status", "--porcelain", "-z").stdout) if wt else None
+        return files, gs
+
+    def state_of(tid: str) -> dict:
+        return json.loads((relay.HERE / "runs" / tid / "STATE.json").read_text(encoding="utf-8"))
+
+    tz8 = timezone(timedelta(hours=8))
+    # ---- 純函式：STATE 相容（1＋1 項）、任務檔解析順序（2 項）、推播文案（1 項）、--status 耗時（1 項）
+    s = relay.state_from_dict({"task_id": "t", "phase": "done", "round": 2, "commit": "abc", "future_key": 1})
+    check("state_from_dict：舊 STATE 缺新欄位、多出未知鍵 → 仍可載入（新欄位用預設值）",
+          s.round == 2 and s.commit == "abc" and s.commits == [] and s.last_feedback == "" and s.resumed == []
+          and not hasattr(s, "future_key"))
+    bad = []
+    for d in ({"task_id": "t", "round": "2"}, {"phase": "done"}, {"task_id": "t", "calls": {}}, [1], {"task_id": "t", "round": True},
+              {"task_id": "t", "round": -1}):
+        try:
+            relay.state_from_dict(d)
+            bad.append(False)
+        except ValueError:
+            bad.append(True)
+    check("state_from_dict：欄位型別不對／缺 task_id／不是物件／round 負數 → ValueError", all(bad), str(bad))
+    with tempfile.TemporaryDirectory() as h:
+        hp = Path(h)
+        (hp / "tasks").mkdir()
+        fallback, st_tf, cli = hp / "tasks" / "t1.json", hp / "state_task.json", hp / "cli.json"
+        for p in (fallback, st_tf, cli):
+            p.write_text("{}", encoding="utf-8")
+        check("任務檔解析：命令列 > state.task_file > tasks/<id>.json；命令列給錯路徑 → None（不默默換別份）",
+              relay.resolve_task_file(str(cli), str(st_tf), "t1", hp) == cli
+              and relay.resolve_task_file(str(hp / "nope.json"), str(st_tf), "t1", hp) is None)
+        orig_here = relay.HERE
+        try:
+            relay.HERE = hp  # 以臨時 HERE 驗預設值是呼叫當下的 HERE
+            got = (relay.resolve_task_file(None, str(st_tf), "t1"), relay.resolve_task_file(None, str(hp / "gone.json"), "t1"),
+                   relay.resolve_task_file(None, "", "t2"))
+        finally:
+            relay.HERE = orig_here
+        check("任務檔解析：state.task_file > HERE/tasks/<id>.json；state 那份不在 → 退回 tasks/<id>.json；都沒有 → None",
+              got == (st_tf, fallback, None), str(got))
+    esc = notify.compose("escalate", "task-1", {"round": 2, "max_rounds": 2}).split("\n")
+    print("       compose(escalate) 前兩行：", esc[0], "｜", esc[1])
+    check("compose[escalate]：第 2 行提示寫 runs/<id>/human_notes.md 後 relay.py --resume <id>",
+          esc[1].startswith("下一步：") and "runs/task-1/human_notes.md" in esc[1] and "relay.py --resume task-1" in esc[1], esc[1])
+    row = relay.status_rows([{"task_id": "a", "phase": "done", "round": 3, "max_rounds": 4, "started": "2026-10-01T10:00:00+0800",
+                              "updated": "2026-10-05T10:30:00+0800", "resumed": [{"ts": "2026-10-05T10:00:00+0800"}]}],
+                            {}, datetime(2026, 10, 5, 12, 0, tzinfo=tz8))[0]
+    check("--status 耗時：resume 過的棒從最後一次 resume 算（不含停著等人的那幾天）", row["elapsed"] == "30分", row["elapsed"])
+
+    tids = ["_test_resume_a", "_test_resume_b", "_test_resume_c", "_test_resume_nostate", "_test_resume_bad",
+            "_test_resume_nowt", "_test_resume_grp"]
+    orig_ledger = relay.LEDGER
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        relay.LEDGER = d / "ledger.jsonl"
+        try:
+            # ---- ① escalate 後 resume ------------------------------------------------------------
+            tid = "_test_resume_a"
+            wt, tf = mk_repo(d / "A", tid)
+            rd = relay.HERE / "runs" / tid
+            made: list = []
+            s1 = {"impl": [{"write": {"a.py": "x = 1\n"}}, {"write": {"a.py": "x = 2\n"}}], "verify": [True, True],
+                  "review": [(False, "總判定：需修改\n請把 x 改成 3（第一輪）"), (False, "總判定：需修改\n請把 x 改成 3（第二輪）")]}
+            with scripted_main(s1, made):
+                rc1, _ = call([str(tf)])
+            st1 = state_of(tid)
+            check("單棒未收斂：last_feedback 落檔（含最後一輪的審查原文）",
+                  rc1 == 2 and st1["phase"] == "escalate" and "第二輪" in st1["last_feedback"], f"rc={rc1} {st1.get('last_feedback')!r}")
+            notes = "請把 x 改成 42，其餘不動。"
+            (rd / "human_notes.md").write_text(notes + "\n", encoding="utf-8-sig")  # 記事本存檔會帶 BOM
+            r1_prompt = (rd / "impl_r1_prompt.md").read_bytes()
+            made = []
+            s2 = {"impl": [{"write": {"a.py": "x = 42\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}
+            with scripted_main(s2, made):
+                rc2, err2 = call(["--resume", tid])
+            st2 = state_of(tid)
+            run = made[0] if made else None
+            impl = [c for c in (run.calls_log if run else []) if c["role"] == "impl"]
+            rev = [c for c in (run.calls_log if run else []) if c["role"] == "review"]
+            check("resume（escalate 後）：exit 0、第一個 resume 輪 rnd=3、STATE.round=3、started 保留原始開跑時間",
+                  rc2 == 0 and impl and impl[0]["round"] == 3 and st2["round"] == 3 and st2["started"] == st1["started"],
+                  f"rc={rc2} {err2[-300:]} rounds={[c['round'] for c in impl]}")
+            check("resume：產生 impl_r3_prompt.md 且含人工意見", (rd / "impl_r3_prompt.md").is_file()
+                  and notes in (rd / "impl_r3_prompt.md").read_text(encoding="utf-8"))
+            check("resume：impl_r1_prompt.md 原封不動", (rd / "impl_r1_prompt.md").read_bytes() == r1_prompt)
+            fb = impl[0]["feedback"] if impl else ""
+            check("resume：第一輪 feedback 以「【人工審查意見」開頭", fb.startswith("【人工審查意見"), fb[:80])
+            check("resume：第一輪 feedback 含 notes 與上一輪未解決的發現（last_feedback）",
+                  notes in fb and "【上一輪未解決的發現" in fb and "第二輪" in fb, fb[:300])
+            instr = (rd / "review_r3_instr.txt").read_text(encoding="utf-8") if (rd / "review_r3_instr.txt").is_file() else ""
+            check("resume：審查指令 review_r3_instr.txt 含「【人工追加要求」與 notes", "【人工追加要求" in instr and notes in instr, instr[-200:])
+            check("resume：人工意見同時進了實作者 prompt 與審查指令，且 BOM 已去掉",
+                  bool(impl and rev) and notes in impl[0]["prompt"] and notes in rev[0]["instr"]
+                  and "﻿" not in impl[0]["prompt"] + rev[0]["instr"])
+            check("resume：human_notes.md 改名為 human_notes.r3.md（原檔不在）",
+                  (rd / "human_notes.r3.md").is_file() and not (rd / "human_notes.md").exists())
+            res = st2.get("resumed") or [{}]
+            check("resume：STATE.resumed 一筆，notes_sha256／from_round=2／first_round=3 正確",
+                  len(st2.get("resumed", [])) == 1 and res[0].get("notes_sha256") == hashlib.sha256(notes.encode("utf-8")).hexdigest()
+                  and res[0].get("from_round") == 2 and res[0].get("first_round") == 3, str(res))
+            handoff_r2 = (rd / "HANDOFF.r2.md").read_text(encoding="utf-8") if (rd / "HANDOFF.r2.md").is_file() else ""
+            handoff_now = (rd / "HANDOFF.md").read_text(encoding="utf-8")
+            check("resume：舊 HANDOFF 保存成 HANDOFF.r2.md（未收斂那份），新 HANDOFF.md 是 done",
+                  bool(handoff_r2) and "（escalate" in handoff_r2.splitlines()[0] and "（done" in handoff_now.splitlines()[0],
+                  f"{handoff_r2[:60]!r} {handoff_now[:60]!r}")
+            cur = (rd / "CURRENT.md").read_text(encoding="utf-8")
+            shown = g(wt, "show", "HEAD:a.py").stdout
+            check("resume 收斂：commit 在 feat/c6（a.py＝x = 42）、commits 一筆、CURRENT 標「人工意見回灌，第 1 次 resume」",
+                  st2["phase"] == "done" and st2["commits"] == [st2["commit"]] and shown == "x = 42\n"
+                  and g(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feat/c6" and "人工意見回灌，第 1 次 resume" in cur,
+                  f"{st2.get('commits')} {shown!r} {cur[:80]!r}")
+
+            # ---- ② 已收斂（已 commit）的棒 resume：同 branch 疊 commit、審查看累積 diff（D11）-------------
+            tid = "_test_resume_b"
+            wt, tf = mk_repo(d / "B", tid)
+            rd = relay.HERE / "runs" / tid
+            with scripted_main({"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}, []):
+                rc1, _ = call([str(tf)])
+            c1, c1_full = state_of(tid)["commit"], g(wt, "rev-parse", "HEAD").stdout.strip()
+            task = json.loads(tf.read_text(encoding="utf-8"))
+            task["allowed_paths"], task["prebuild"] = ["a.py", "b.py"], ["exit 7"]  # 要擴範圍先改任務檔；prebuild 會失敗
+            tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+            (rd / "human_notes.md").write_text("再加 b.py：y = 2", encoding="utf-8")
+            made = []
+            with scripted_main({"impl": [{"write": {"b.py": "y = 2\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}, made):
+                rc2, err2 = call(["--resume", tid])
+            st2 = state_of(tid)
+            log2 = g(wt, "log", "--oneline", "-2").stdout.strip().splitlines()
+            print("       ② git log --oneline -2：", " ｜ ".join(log2))
+            check("已收斂棒 resume：exit 0（任務檔的 prebuild 會失敗 → 證明 resume 沒跑 prebuild）", rc1 == 0 and rc2 == 0,
+                  f"rc1={rc1} rc2={rc2} {err2[-300:]}")
+            rdiff = (rd / "review_r2_diff.txt").read_text(encoding="utf-8") if (rd / "review_r2_diff.txt").is_file() else ""
+            check("已收斂棒 resume：審查 diff 以 base_commit 為基準（含第一顆 commit 的 a.py 改動＋新的 b.py）",
+                  "+x = 1" in rdiff and "+y = 2" in rdiff, rdiff[:400])
+            new_files = g(wt, "show", "--name-only", "--format=", "HEAD").stdout.split()
+            check("已收斂棒 resume：同 branch 多一顆 commit、前一顆 SHA 不變、新 commit 只收增量 b.py",
+                  len(log2) == 2 and g(wt, "rev-parse", "HEAD~1").stdout.strip() == c1_full and new_files == ["b.py"]
+                  and g(wt, "rev-list", "--count", "main..feat/c6").stdout.strip() == "2", f"{log2} {new_files}")
+            check("已收斂棒 resume：state.commits 兩筆、commit 欄＝最新一顆",
+                  len(st2["commits"]) == 2 and st2["commits"][0] == c1 and st2["commits"][1] == st2["commit"] != c1, str(st2["commits"]))
+
+            # ---- ③ 拒跑：清楚的錯誤、exit 3、不改任何檔 ---------------------------------------------
+            tid = "_test_resume_c"
+            wt, tf = mk_repo(d / "C", tid, max_rounds=1)
+            rd = relay.HERE / "runs" / tid
+            with scripted_main({"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True],
+                                "review": [(False, "總判定：需修改")]}, []):
+                call([str(tf)])
+
+            def refused(label: str, argv: list[str], want: str, rd_: Path, wt_) -> None:
+                before = snap(rd_, wt_)
+                with scripted_main({"impl": [], "verify": [], "review": []}, []):
+                    rc, err = call(argv)
+                check(f"拒跑：{label} → exit 3、訊息含「{want}」、runs/ 與 worktree 沒有任何改動",
+                      rc == 3 and want in err and snap(rd_, wt_) == before, f"rc={rc} err={err.strip()[-200:]}")
+
+            refused("沒有 STATE", ["--resume", "_test_resume_nostate"], "STATE.json", relay.HERE / "runs" / "_test_resume_nostate", None)
+            check("拒跑：沒有 STATE 時不會替它建 runs/<id>/", not (relay.HERE / "runs" / "_test_resume_nostate").exists())
+            refused("human_notes.md 不存在", ["--resume", tid], "human_notes.md", rd, wt)
+            (rd / "human_notes.md").write_bytes(b"\xef\xbb\xbf  \r\n\t\n")
+            refused("human_notes.md 只有空白／BOM", ["--resume", tid], "是空的", rd, wt)
+            for label, text in (("STATE 損壞（不是 JSON）", "{oops"), ("STATE 損壞（round 型別不對）", json.dumps({"task_id": "_test_resume_bad", "round": "2"}))):
+                bd = relay.HERE / "runs" / "_test_resume_bad"
+                bd.mkdir(parents=True, exist_ok=True)
+                (bd / "STATE.json").write_text(text, encoding="utf-8")
+                (bd / "human_notes.md").write_text("x", encoding="utf-8")
+                refused(label, ["--resume", "_test_resume_bad"], "損壞", bd, None)
+            nd = relay.HERE / "runs" / "_test_resume_nowt"
+            nd.mkdir(parents=True, exist_ok=True)
+            missing_wt = d / "no_such_worktree"
+            ntask = {**json.loads(tf.read_text(encoding="utf-8")), "id": "_test_resume_nowt", "worktree": str(missing_wt)}
+            (d / "nowt.json").write_text(json.dumps(ntask, ensure_ascii=False), encoding="utf-8")
+            (nd / "STATE.json").write_text(json.dumps({"task_id": "_test_resume_nowt", "phase": "escalate", "round": 1,
+                                                       "worktree": str(missing_wt), "task_file": str(d / "nowt.json")}), encoding="utf-8")
+            (nd / "human_notes.md").write_text("x", encoding="utf-8")
+            refused("worktree 不存在", ["--resume", "_test_resume_nowt"], "worktree 不存在", nd, None)
+            (rd / "human_notes.md").write_text("請改成 x = 5", encoding="utf-8")  # 以下各條：除了被測條件，其餘都合格
+            held = relay.runlock.try_hold(relay.task_lock_path(tid))
+            try:
+                refused("任務鎖被持有（同一任務正在跑）", ["--resume", tid], "正在跑", rd, wt)
+            finally:
+                held.release()
+            gd = relay.HERE / "runs" / "_test_resume_grp"
+            gd.mkdir(parents=True, exist_ok=True)
+            (gd / "GROUP.json").write_text("{}", encoding="utf-8")
+            refused("群組 id（runs/<id>/GROUP.json）", ["--resume", "_test_resume_grp"], "群組不能 resume", gd, None)
+            orig_task = tf.read_text(encoding="utf-8")
+            tf.write_text(json.dumps({**json.loads(orig_task), "candidates": [{"implementer": "codex"}, {"implementer": "codex"}]}),
+                          encoding="utf-8")
+            refused("任務檔宣告 candidates（群組）", ["--resume", tid], "群組不能 resume", rd, wt)
+            tf.write_text(orig_task, encoding="utf-8")
+            g(wt, "checkout", "-q", "main")  # 測試自己切走（relay 不會做這件事）
+            refused("worktree 不在任務分支上", ["--resume", tid], "relay 不代為 checkout", rd, wt)
+            g(wt, "checkout", "-q", "feat/c6")
+            (rd / "impl_r5_prompt.md").write_text("殘留", encoding="utf-8")
+            refused("runs/<id>/ 有比 STATE.round 新的輪次紀錄", ["--resume", tid], "狀態對不上", rd, wt)
+            (rd / "impl_r5_prompt.md").unlink()
+            refused("--rounds 0", ["--resume", tid, "--rounds", "0"], "--rounds", rd, wt)
+            refused("--rounds 沒配 --resume", [str(tf), "--rounds", "2"], "--rounds", rd, wt)
+
+            # ---- dry-run＋resume：只印計畫（讀 notes、不改名、不寫 .dry 以外的檔）--------------------
+            before = snap(rd, wt)
+            relay.paths.check_all, orig_check = (lambda: ["不該被呼叫"]), relay.paths.check_all
+            try:
+                rc, err = call(["--resume", tid, "--dry-run"])
+            finally:
+                relay.paths.check_all = orig_check
+            dry_prompt = relay.HERE / "runs" / (tid + ".dry") / "impl_r2_prompt.md"
+            check("dry-run＋resume：exit 0、notes 不改名、runs/<id>/ 與 worktree 不變、計畫寫在 .dry（impl_r2_prompt.md 含 notes）",
+                  rc == 0 and snap(rd, wt) == before and (rd / "human_notes.md").is_file() and dry_prompt.is_file()
+                  and "請改成 x = 5" in dry_prompt.read_text(encoding="utf-8"), f"rc={rc} {err[-300:]}")
+        finally:
+            relay.LEDGER = orig_ledger
+            for t in tids:
+                rm_runs(t)
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -911,7 +1223,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram):
+                   test_notify, test_notify_telegram, test_resume):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()
