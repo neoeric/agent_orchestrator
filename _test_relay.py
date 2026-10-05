@@ -1,6 +1,6 @@
 """_test_relay.py — relay 的純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本、改動判定、
 陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）、人工意見回灌 --resume（C6）、
-實作者可插拔 codex｜claude＋生產目錄守門（C4a）。不呼叫任何 AI CLI。
+實作者可插拔 codex｜claude＋生產目錄守門（C4a）、撞牆換手（C5）。不呼叫任何 AI CLI。
 
 跑法：PYTHONUTF8=1 python _test_relay.py   （exit 0＝全過）
 """
@@ -752,14 +752,14 @@ def test_notify() -> None:
                 r2.notify("aborted", reason="x")
             cur = (r2.dir / "CURRENT.md").read_text(encoding="utf-8")
             check("被節流（同任務同類型 dedupe）→ CURRENT.md 末尾附「推播未發（dedupe）」", "推播未發（dedupe）" in cur, cur)
-            # 一棒的所有出口只發一則：Run.abort(kind=rate_limit) 帶 cli 進文案（1 項）
+            # 撞牆出口（C5 起走 run() 的 escalate 分支，不再經 abort）：Run.notify("rate_limit", cli=…) 帶 cli 進文案（1 項）
             out_rl = d / "o_rl.txt"
             os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out_rl))
             with contextlib.redirect_stdout(io.StringIO()):
                 r3 = relay.Run({**task, "id": tid + "_rl"}, dry=False)
-                r3.abort("撞牆：codex 回 rate_limit", kind="rate_limit", cli="codex")
+                r3.notify("rate_limit", cli="codex", role="implementer")
             body = out_rl.read_text(encoding="utf-8") if out_rl.is_file() else ""
-            check("abort(kind='rate_limit', cli=…)：推播第 1 行含 codex 與「撞牆」", body.startswith("rate_limit|【relay】") and "codex" in body.split("\n")[0]
+            check("Run.notify('rate_limit', cli=…)：推播第 1 行含 codex 與「撞牆」", body.startswith("rate_limit|【relay】") and "codex" in body.split("\n")[0]
                   and "撞牆" in body.split("\n")[0], body)
             rm_runs(tid + "_rl")
 
@@ -801,8 +801,11 @@ def test_notify() -> None:
                 self.notify("ready_to_merge")
                 return 0
 
-            def run_wall(self):
-                raise relay.RateLimitStop("撞牆：codex 回 rate_limit（測試）", cli="codex")
+            def run_wall(self):  # C5（2026-10-05）起撞牆走 run() 的 escalate 出口回 2，不再丟例外
+                self.state.verdict = "rate_limit"
+                self.save("escalate")
+                self.notify("rate_limit", cli="codex", role="implementer")
+                return 2
 
             try:
                 rcs = {}
@@ -812,7 +815,7 @@ def test_notify() -> None:
                     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         rcs[name] = relay.main([str(d / "task.json")])
                     rm_runs(tid + "_m")
-                check("main：推播指令 exit 7 時，收斂棒仍回 0、撞牆棒仍回 3", rcs == {"收斂": 0, "撞牆": 3}, str(rcs))
+                check("main：推播指令 exit 7 時，收斂棒仍回 0、撞牆棒仍回 2", rcs == {"收斂": 0, "撞牆": 2}, str(rcs))
                 relay.Run.run = run_ok
                 n_before = _n_sent(d / "o_main.txt")
                 relay.NOTIFY_LEDGER = d / "nl_main_nn.jsonl"
@@ -904,7 +907,10 @@ class ScriptedRun(relay.Run):
     """規格 §12 共用測試骨架（2026-10-05，C6 起用）：implement／verify／review／negative_control 依腳本回傳，
     不呼叫任何 CLI。prompt 與審查指令沿用真的組法（impl_prompt／review_inputs），才驗得到兩個角色實際拿到什麼。
     script＝{"impl": [{"write": {相對路徑: 內容}}…], "verify": [bool…], "review": [(approved, 原文)…]}，每次呼叫 pop 一筆。
-    C4a（2026-10-05）：impl 步驟另可給 {"write_abs": {絕對路徑: 內容}}（模擬實作者寫到 worktree 外，例如生產目錄）。"""
+    C4a（2026-10-05）：impl 步驟另可給 {"write_abs": {絕對路徑: 內容}}（模擬實作者寫到 worktree 外，例如生產目錄）。
+    C5（2026-10-05）：impl 步驟可給 "ok": False＋"failure_class"（例如 "rate_limit"）；檔名主幹照真實作（relay.impl_stem），
+    stdout 落一份假檔；calls_log 記 cli／attempt／stem 與開工當下 worktree 的 a.py（驗半成品有沒有被保留）。
+    review 步驟可給 {"tool_ok": False, "failure_class": "rate_limit"}（審查工具故障／撞牆）。"""
 
     def __init__(self, task, script, **kw):
         super().__init__(task, dry=False, **kw)
@@ -913,14 +919,21 @@ class ScriptedRun(relay.Run):
 
     def implement(self, rnd, feedback, cli=None, attempt=0):
         step = self.script["impl"].pop(0)
-        prompt = self.impl_prompt(rnd, feedback)
-        self.calls_log.append({"role": "impl", "round": rnd, "feedback": feedback, "prompt": prompt, "cli": cli})
+        cli = cli or self.impl_cli
+        stem = relay.impl_stem(rnd, attempt, cli)
+        prompt = self.impl_prompt(rnd, feedback, stem=stem)
+        a_py = Path(self.wt, "a.py")
+        self.calls_log.append({"role": "impl", "round": rnd, "feedback": feedback, "prompt": prompt, "cli": cli,
+                               "attempt": attempt, "stem": stem,
+                               "a_py": a_py.read_text(encoding="utf-8") if a_py.is_file() else None})
         for name, text in step.get("write", {}).items():
             Path(self.wt, name).write_bytes(text.encode("utf-8"))
         for name, text in step.get("write_abs", {}).items():
             Path(name).write_bytes(text.encode("utf-8"))
         ok = step.get("ok", True)
-        self.record(relay.CallRecord("implementer", rnd, ok, "scripted", 0, 0.0, None, "", cli=cli or "codex",
+        so = self.dir / f"{stem}.stdout.txt"
+        so.write_text("（腳本實作者的假 stdout）", encoding="utf-8")
+        self.record(relay.CallRecord("implementer", rnd, ok, "scripted", 0, 0.0, None, str(so), cli=cli,
                                      failure_class=step.get("failure_class")))
         return ok, f"（腳本實作者第 {rnd} 輪）", None
 
@@ -931,9 +944,14 @@ class ScriptedRun(relay.Run):
         return ok, f"- v: {'PASS' if ok else 'FAIL'}"
 
     def review(self, rnd, diff):
-        approved, text = self.script["review"].pop(0)
-        instr_f, _, _ = self.review_inputs(rnd, diff)
+        step = self.script["review"].pop(0)
+        instr_f, _, out_f = self.review_inputs(rnd, diff)
         self.calls_log.append({"role": "review", "round": rnd, "instr": instr_f.read_text(encoding="utf-8"), "diff": diff})
+        if isinstance(step, dict) and step.get("tool_ok") is False:
+            self.record(relay.CallRecord("reviewer", rnd, False, "scripted", 1, 0.0, None, str(out_f), cli="agy",
+                                         failure_class=step.get("failure_class")))
+            return False, "", None, False
+        approved, text = step
         self.record(relay.CallRecord("reviewer", rnd, True, "scripted", 0, 0.0, None, "", cli="agy"))
         self.state.review_decisions.append({"round": rnd, "structured": True, "approved": approved, "unreported": [], "checks": []})
         self.save()
@@ -1391,8 +1409,8 @@ def test_impl_command() -> None:
             rm_runs("_test_impl_task")
             rcs = [main_rc(x, "--dry-run")[0] for x in ({"implementer_effort": {"codex": "high"}}, {"implementer_effort": {"claude": "turbo"}},
                                                          {"implementer_models": {"gemini": "x"}}, {"implementer_models": {"claude": ""}},
-                                                         {"implementer": ["codex", "claude"]})]
-            check("implementer_models／implementer_effort 寫錯、implementer 給 list（C5 前不支援）→ main 回 3", rcs == [3] * 5, str(rcs))
+                                                         {"implementer": ["codex", "gemini"]})]
+            check("implementer_models／implementer_effort 寫錯、implementer 清單含未知值 → main 回 3", rcs == [3] * 5, str(rcs))
 
             # 8. check_all 需求計算（2 項）
             calls: list = []
@@ -1499,6 +1517,304 @@ def test_impl_command() -> None:
           "D:\\" not in seg and "Tooling" not in seg and str(relay.HERE) in relay.IMPL_RULES, seg[:200])
 
 
+def test_handoff() -> None:
+    """C5（2026-10-05）：judge 判 rate_limit 時換另一支 CLI 接手實作（規格 §8 測試案例 1–7，另加邊界）。
+    真 rate_limit 樣本不存在 ⇒ 全程 ScriptedRun 合成，不呼叫任何 AI CLI。帳本、鎖指暫存；推播設定指到不存在的路徑，
+    推播內容另以假的 notify.notify 攔截（不呼叫任何通道）；臨時 repo 的 autocrlf 在 local 明設。"""
+    import copy
+    import re
+    import subprocess
+    from datetime import datetime, timedelta, timezone
+    from tools import notify
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def mk_repo(d: Path, tid: str, **extra) -> tuple[Path, Path]:
+        """臨時 repo＝worktree（main 一顆 commit，切到 feat/c5），任務檔放 repo 外；預設 implementer＝[codex, claude]。"""
+        wt = d / "repo"
+        wt.mkdir(parents=True)
+        g(wt, "init", "-q", "-b", "main"); g(wt, "config", "user.email", "t@t"); g(wt, "config", "user.name", "t")
+        g(wt, "config", "core.autocrlf", "false")
+        (wt / "a.py").write_bytes(b"x = 0\n")
+        g(wt, "add", "-A"); g(wt, "commit", "-qm", "base"); g(wt, "checkout", "-q", "-b", "feat/c5")
+        (d / "spec.md").write_text("把 x 改成 1", encoding="utf-8")
+        (d / "review.md").write_text("1. x 有改", encoding="utf-8")
+        task = {"id": tid, "title": "c5 測試", "repo": str(wt), "base_branch": "main", "branch": "feat/c5", "worktree": str(wt),
+                "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
+                "review": {"policy": "always", "instructions_file": str(d / "review.md")},
+                "allowed_paths": ["a.py"], "max_rounds": 2, "implementer": ["codex", "claude"], **extra}
+        tf = d / "task.json"
+        tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+        return wt, tf
+
+    def call(argv: list[str]) -> tuple[int, str, str]:
+        """跑 main；stdout 去掉 ANSI 色碼（emit 只給 [TAG] 上色）才比對得到「[JUDGE] …」整句。"""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = relay.main(argv)
+        return rc, re.sub(r"\x1b\[[0-9;]*m", "", out.getvalue()), err.getvalue()
+
+    def state_of(tid: str) -> dict:
+        return json.loads((relay.HERE / "runs" / tid / "STATE.json").read_text(encoding="utf-8"))
+
+    def impls(run) -> list[dict]:
+        return [c for c in run.calls_log if c["role"] == "impl"]
+
+    tz8 = timezone(timedelta(hours=8))
+    t0 = datetime(2026, 10, 5, 12, 0, tzinfo=tz8)
+    fmt = "%Y-%m-%dT%H:%M:%S%z"
+    order = ["codex", "claude"]
+    P = relay.pick_implementer
+    # ---- 1. pick_implementer（5 項）---------------------------------------------------------------
+    near = {"codex": t0 - timedelta(minutes=10)}
+    both = {"codex": t0 - timedelta(minutes=10), "claude": t0 - timedelta(minutes=20)}
+    check("pick_implementer：無冷卻 → 第一個（codex）", P(order, set(), {}, 0) == "codex")
+    check("pick_implementer：cooling={codex} → claude", P(order, {"codex"}, {}, 0) == "claude")
+    check("pick_implementer：全部 cooling → None", P(order, {"codex", "claude"}, {}, 0) is None)
+    check("pick_implementer：cooldown 開且 codex 在窗內 → claude（cooldown=0 時同一份 recent 不影響 → codex）",
+          P(order, set(), near, 60) == "claude" and P(order, set(), near, 0) == "codex")
+    check("pick_implementer：cooldown 開且兩支都在窗內 → codex（不回 None：永不讓任務無人可用）", P(order, set(), both, 60) == "codex")
+
+    # ---- 2. ledger_recent_rate_limits（1 項）＋ --ledger 的 last_rate_limit（1 項）----------------------
+    orig_ledger = relay.LEDGER
+    with tempfile.TemporaryDirectory() as h:
+        led = Path(h) / "ledger.jsonl"
+        rows = [{"ts": (t0 - timedelta(minutes=30)).strftime(fmt), "cli": "codex", "failure_class": "rate_limit"},
+                {"ts": (t0 - timedelta(minutes=90)).strftime(fmt), "cli": "claude", "failure_class": "rate_limit"},
+                {"ts": "壞掉的時間", "cli": "agy", "failure_class": "rate_limit"},
+                {"ts": (t0 - timedelta(minutes=5)).strftime(fmt), "cli": "claude", "failure_class": None}]
+        led.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n{壞行\n", encoding="utf-8")
+        got = relay.ledger_recent_rate_limits(t0, 60, led)
+        check("ledger_recent_rate_limits：30 分前／90 分前／壞 ts／非 rate_limit 各一筆，minutes=60 → 只回 30 分那筆；minutes=0 → {}",
+              got == {"codex": t0 - timedelta(minutes=30)} and relay.ledger_recent_rate_limits(t0, 0, led) == {}, str(got))
+        relay.LEDGER = led
+        try:
+            rc, out, _ = call(["--ledger"])
+        finally:
+            relay.LEDGER = orig_ledger
+        lines = {ln.split()[0]: ln for ln in out.splitlines() if ln.strip()}
+        check("--ledger：每支 CLI 多 last_rate_limit= 欄（codex＝那筆 ts；沒撞過的 → -）",
+              rc == 0 and f"last_rate_limit={rows[0]['ts']}" in lines.get("codex", "")
+              and lines.get("claude", "").endswith(f"last_rate_limit={rows[1]['ts']}") and all("last_rate_limit=" in v for v in lines.values()), out)
+        led.write_text(json.dumps({"ts": rows[3]["ts"], "cli": "claude", "failure_class": None}) + "\n", encoding="utf-8")
+        relay.LEDGER = led
+        try:
+            rc, out, _ = call(["--ledger"])
+        finally:
+            relay.LEDGER = orig_ledger
+        check("--ledger：從沒撞過牆的 CLI → last_rate_limit=-", rc == 0 and out.strip().endswith("last_rate_limit=-"), out)
+
+    # ---- 任務檔：implementer 清單與 handoff_cooldown_minutes 的驗證（1 項）＋需求計算（1 項）＋推播文案（1 項）----
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as h:
+        hp = Path(h)
+        (hp / "spec.md").write_text("s", encoding="utf-8")
+        (hp / "rev.md").write_text("r", encoding="utf-8")
+        base = {"id": "_test_handoff_cfg", "repo": str(hp / "nope"), "base_branch": "main", "branch": "feat/x",
+                "worktree": str(hp / "nope_wt"), "spec_file": str(hp / "spec.md"), "verify": [],
+                "review": {"policy": "always", "instructions_file": str(hp / "rev.md")}}
+        rcs = []
+        for extra in ({"implementer": []}, {"implementer": ["codex", "codex"]}, {"implementer": ["codex", 1]}, {"implementer": "Codex"},
+                      {"handoff_cooldown_minutes": -1}, {"handoff_cooldown_minutes": True}, {"handoff_cooldown_minutes": "5"},
+                      {"handoff_cooldown_minutes": 1.5}, {"implementer": ["codex", "claude"], "handoff_cooldown_minutes": 30}):
+            (hp / "t.json").write_text(json.dumps({**base, **extra}), encoding="utf-8")
+            rcs.append(call([str(hp / "t.json"), "--dry-run"])[:2])
+        rm_runs("_test_handoff_cfg")
+        check("任務檔：implementer 空清單／重複／非字串／大小寫錯、cooldown 負數／bool／字串／小數 → 3；[codex, claude]＋cooldown 30 dry-run → 0 且印出換手順序",
+              [r[0] for r in rcs] == [3] * 8 + [0] and "實作者順序 codex → claude" in rcs[-1][1] and "帳本冷卻 30 分" in rcs[-1][1],
+              str([r[0] for r in rcs]))
+        t_list = relay.load_task(hp / "t.json")
+        check("required_clis：implementer=[codex, claude] → 兩支都要（備援缺了要在開跑前大聲說）",
+              relay.required_clis(t_list) == {"need_codex": True, "need_claude": True, "need_agy": True}, str(relay.required_clis(t_list)))
+    c_rl = notify.compose("rate_limit", "t1", {"cli": "agy", "role": "reviewer", "minutes": 4}).split("\n")
+    c_ok = notify.compose("ready_to_merge", "t1", {"round": 1, "commit": "abc", "minutes": 3, "handoff": "codex→claude"}).split("\n")
+    print("       compose(rate_limit, reviewer)：", " ｜ ".join(c_rl))
+    check("推播文案：審查者撞牆第 1 行「撞牆停下：審查者 agy」、第 2 行給 --resume；換手後收斂第 3 行附「途中 codex→claude 換手」",
+          "撞牆停下：審查者 agy 回 rate_limit" in c_rl[0] and "relay.py --resume t1" in c_rl[1]
+          and c_ok[2] == "耗時 3 分；途中 codex→claude 換手", f"{c_rl} {c_ok}")
+
+    tids = ["_test_handoff_a", "_test_handoff_b", "_test_handoff_c", "_test_handoff_d1", "_test_handoff_d2", "_test_handoff_d3",
+            "_test_handoff_rec", "_test_handoff_real"]
+    orig_notify, orig_build = notify.notify, relay.build_impl_command
+    sent: list = []
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        relay.LEDGER = d / "ledger.jsonl"
+        notify.notify = lambda kind, task_id, info, **kw: (sent.append((kind, task_id, dict(info))) or "推播關閉")
+        try:
+            # ---- 3. codex 撞牆 → claude 同一輪接手並收斂（5 項＋6 項）-----------------------------------------
+            tid = "_test_handoff_a"
+            wt, tf = mk_repo(d / "A", tid)
+            rd = relay.HERE / "runs" / tid
+            made: list = []
+            s = {"impl": [{"ok": False, "failure_class": "rate_limit", "write": {"a.py": "x = 1  # 半成品\n"}},
+                          {"write": {"a.py": "x = 1\n"}}],
+                 "verify": [True], "review": [(True, "總判定：可合併")]}
+            with scripted_main(s, made):
+                rc, out, err = call([str(tf)])
+            st = state_of(tid)
+            run = made[0] if made else None
+            im = impls(run) if run else []
+            print("       ③ [JUDGE] 行：", " ｜ ".join(ln.split("[JUDGE] ", 1)[-1][:70] for ln in out.splitlines() if "[JUDGE]" in ln))
+            check("換手不消耗輪數：收斂 exit 0、state.round==1（沒有開第 2 輪）", rc == 0 and st["round"] == 1 and st["phase"] == "done",
+                  f"rc={rc} round={st.get('round')} {err[-300:]}")
+            check("換手不消耗輪數：該輪 verify 只跑 1 次", len(st["verify"]) == 1 and s["verify"] == [], str(st["verify"]))
+            hs = st.get("handoffs", [])
+            check("state.handoffs 一筆：round 1 codex→claude、reason=rate_limit、記原始輸出路徑",
+                  len(hs) == 1 and (hs[0]["round"], hs[0]["from"], hs[0]["to"], hs[0]["reason"]) == (1, "codex", "claude", "rate_limit")
+                  and hs[0].get("stdout_file", "").endswith("impl_r1.stdout.txt"), str(hs))
+            check("第二次實作的 feedback 以「【換手說明】」開頭、點名前一位（Codex）",
+                  len(im) == 2 and im[1]["feedback"].startswith("【換手說明】") and "Codex" in im[1]["feedback"].split("\n")[0], str(im[1:]))
+            check("換手那次的紀錄檔名含 _h1_claude（prompt 與 stdout），第一次的 impl_r1_prompt.md 沒被覆蓋",
+                  len(im) == 2 and im[1]["stem"] == "impl_r1_h1_claude" and (rd / "impl_r1_h1_claude_prompt.md").is_file()
+                  and "_h1_claude" in st["calls"][1]["stdout_file"] and (rd / "impl_r1_prompt.md").is_file()
+                  and "【換手說明】" not in (rd / "impl_r1_prompt.md").read_text(encoding="utf-8"), str([c.get("stem") for c in im]))
+            check("D9 worktree 不重置：claude 開工時看得到 codex 留下的半成品", len(im) == 2 and im[1]["a_py"] == "x = 1  # 半成品\n",
+                  str([c.get("a_py") for c in im]))
+            check("實作者呼叫依序是 codex（attempt 0）→ claude（attempt 1）",
+                  [(c["cli"], c["attempt"]) for c in im] == [("codex", 0), ("claude", 1)], str([(c["cli"], c["attempt"]) for c in im]))
+            p2 = im[1]["prompt"] if len(im) == 2 else ""
+            check("換手 prompt：【換手說明】自成一段，沒有被套上「【上一輪審查／驗證的發現…】」的空帽子",
+                  "【換手說明】" in p2 and "【上一輪審查" not in p2, p2[-300:])
+            check("[JUDGE] 印出撞牆（含原始輸出與「收進 fixtures」提示）與換手（只限本棒、不下架任何 Agent）",
+                  "[JUDGE] 🔴 codex 回 rate_limit" in out and "fixtures/codex_rate_limit" in out
+                  and "換手：codex → claude" in out and "不下架任何 Agent" in out, out[-600:])
+            body = g(wt, "log", "-1", "--format=%B").stdout
+            handoff_md = (rd / "HANDOFF.md").read_text(encoding="utf-8")
+            check("收斂後 commit 訊息與 STATE 記實際的最後實作者（Claude Code、途中 codex→claude 換手）",
+                  st.get("implementer") == "claude" and "Claude Code（途中 codex→claude 換手） 實作" in body, body)
+            ready = [x for x in sent if x[1] == tid]
+            check("推播 ready_to_merge 帶 handoff=codex→claude；HANDOFF.md「用量」節前有「換手紀錄：round 1 codex→claude」",
+                  len(ready) == 1 and ready[0][0] == "ready_to_merge" and ready[0][2].get("handoff") == "codex→claude"
+                  and "換手紀錄：round 1 codex→claude" in handoff_md
+                  and handoff_md.index("換手紀錄：") < handoff_md.index("## 用量"), str(ready))
+
+            # ---- 4. 兩支都撞牆 → verdict rate_limit、run() 回 2、沒有例外外拋（3 項＋2 項）--------------------------
+            tid = "_test_handoff_b"
+            wt, tf = mk_repo(d / "B", tid)
+            task = relay.load_task(tf)
+            s = {"impl": [{"ok": False, "failure_class": "rate_limit"}, {"ok": False, "failure_class": "rate_limit"}],
+                 "verify": [], "review": []}
+            exc = None
+            r = ScriptedRun(task, s)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = r.run()
+            except Exception as e:  # noqa: BLE001  這條測試要證明「沒有任何例外外拋」
+                exc, rc = e, None
+            st = state_of(tid)
+            check("兩支都撞牆：run() 回 2、沒有任何例外外拋", exc is None and rc == 2, repr(exc))
+            check("兩支都撞牆：verdict rate_limit、phase escalate、verify 沒跑、沒開第 2 輪",
+                  st["verdict"] == "rate_limit" and st["phase"] == "escalate" and st["verify"] == [] and st["round"] == 1
+                  and [c["cli"] for c in impls(r)] == ["codex", "claude"], str({k: st.get(k) for k in ("verdict", "phase", "round")}))
+            wall = [x for x in sent if x[1] == tid]
+            check("兩支都撞牆：推播 kind rate_limit、cli＝codex、claude（一則）",
+                  len(wall) == 1 and wall[0][0] == "rate_limit" and wall[0][2].get("cli") == "codex、claude"
+                  and wall[0][2].get("role") == "implementer", str(wall))
+            rd = relay.HERE / "runs" / tid
+            handoff_md = (rd / "HANDOFF.md").read_text(encoding="utf-8")
+            check("兩支都撞牆：HANDOFF 卡點寫「可用的實作者都撞牆」與 --resume、CURRENT 寫「撞牆停下」",
+                  "可用的實作者都撞牆" in handoff_md and f"relay.py --resume {tid}" in handoff_md
+                  and "撞牆停下" in (rd / "CURRENT.md").read_text(encoding="utf-8"), handoff_md[:400])
+            row = relay.status_rows([st], {}, datetime.now(tz8))[0]
+            check("--status：verdict rate_limit → 要人看（撞牆）", row["waiting"] == "要人看（撞牆）", row["waiting"])
+
+            # ---- 5. 審查者撞牆 → reviewer_rate_limit、不開下一輪、不換別家審（2 項＋2 項）-------------------------------
+            tid = "_test_handoff_c"
+            wt, tf = mk_repo(d / "C", tid)
+            made = []
+            s = {"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [{"tool_ok": False, "failure_class": "rate_limit"}]}
+            with scripted_main(s, made):
+                rc, out, err = call([str(tf)])
+            st = state_of(tid)
+            run = made[0] if made else None
+            check("審查者撞牆：verdict reviewer_rate_limit、exit 2", rc == 2 and st["verdict"] == "reviewer_rate_limit"
+                  and st["phase"] == "escalate", f"rc={rc} verdict={st.get('verdict')} {err[-300:]}")
+            check("審查者撞牆：不開下一輪（max_rounds=2 只跑 1 次實作、round 仍 1）、實作者不換手",
+                  run is not None and len(impls(run)) == 1 and st["round"] == 1 and st.get("handoffs") == [], str(st.get("handoffs")))
+            rv = [x for x in sent if x[1] == tid]
+            check("審查者撞牆：推播 kind rate_limit、role=reviewer、cli=agy；[JUDGE] 印撞牆與「不換別家審」",
+                  len(rv) == 1 and rv[0][0] == "rate_limit" and rv[0][2].get("role") == "reviewer" and rv[0][2].get("cli") == "agy"
+                  and "[JUDGE] 🔴 agy 回 rate_limit" in out and "不換別家審" in out, str(rv))
+            row = relay.status_rows([st], {}, datetime.now(tz8))[0]
+            check("--status：verdict reviewer_rate_limit → 要人看（撞牆）", row["waiting"] == "要人看（撞牆）", row["waiting"])
+
+            # ---- 6. 紅線：A 棒換手後，新建 B 棒仍從第一順位開始；task dict／task 檔都沒被改（2 項＋1 項）--------------------
+            tid = "_test_handoff_d1"
+            wt, tf_a = mk_repo(d / "D1", tid)
+            tf_a_bytes = tf_a.read_bytes()
+            task_a = relay.load_task(tf_a)
+            snap_a = copy.deepcopy(task_a)
+            r = ScriptedRun(task_a, {"impl": [{"ok": False, "failure_class": "rate_limit"}, {"write": {"a.py": "x = 1\n"}}],
+                                     "verify": [True], "review": [(True, "總判定：可合併")]})
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_a = r.run()
+            tid = "_test_handoff_d2"
+            wt, tf_b = mk_repo(d / "D2", tid, handoff_cooldown_minutes=0)
+            tf_b_bytes = tf_b.read_bytes()
+            made = []
+            with scripted_main({"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}, made):
+                rc_b, out_b, err_b = call([str(tf_b)])
+            first_b = impls(made[0])[0]["cli"] if made and impls(made[0]) else None
+            check("紅線：A 棒 codex 撞牆換 claude 後（帳本已有 codex 的 rate_limit），新建 B 棒（cooldown=0）第一次實作仍用 codex",
+                  rc_a == 0 and r.state.handoffs and rc_b == 0 and first_b == "codex" and state_of(tid).get("handoffs") == [],
+                  f"rc_a={rc_a} rc_b={rc_b} first_b={first_b} {err_b[-200:]}")
+            check("紅線：過程中 task dict（Run.t 與原物件）與兩份 task 檔的內容都沒被修改",
+                  task_a == snap_a and r.t == snap_a and tf_a.read_bytes() == tf_a_bytes and tf_b.read_bytes() == tf_b_bytes,
+                  f"{task_a == snap_a} {r.t == snap_a} {tf_a.read_bytes() == tf_a_bytes} {tf_b.read_bytes() == tf_b_bytes}")
+            tid = "_test_handoff_d3"
+            wt, tf_c = mk_repo(d / "D3", tid, handoff_cooldown_minutes=60)
+            # 另起一份帳本：上面第 4 條也記了 claude 的 rate_limit，兩支都在窗內會（正確地）退回 codex，量不到這條邊界
+            relay.LEDGER = d / "ledger_d3.jsonl"
+            relay.LEDGER.write_text(json.dumps({"ts": relay.now(), "cli": "codex", "role": "implementer",
+                                                "failure_class": "rate_limit"}) + "\n", encoding="utf-8")
+            made = []
+            with scripted_main({"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}, made):
+                rc_c, out_c, err_c = call([str(tf_c)])
+            hs = state_of(tid).get("handoffs", [])
+            first_c = impls(made[0])[0]["cli"] if made and impls(made[0]) else None
+            check("邊界：cooldown=60 且帳本裡 codex 在窗內撞過 → 本棒從 claude 開始、[JUDGE] 說明、handoffs 記 cooldown（仍收斂）",
+                  rc_c == 0 and first_c == "claude" and len(hs) == 1 and hs[0]["reason"] == "cooldown" and hs[0]["from"] == "codex"
+                  and "[JUDGE] 略過 codex" in out_c and "不下架任何 Agent" in out_c, f"rc={rc_c} first={first_c} {hs} {err_c[-200:]}")
+
+            # ---- 7. record() 遇到 rate_limit 不 raise（1 項）------------------------------------------------------
+            r = relay.Run({"id": "_test_handoff_rec", "worktree": str(d), "repo": str(d)}, dry=False)
+            n0 = len(relay.LEDGER.read_text(encoding="utf-8").splitlines())
+            try:
+                r.record(relay.CallRecord("implementer", 1, False, "429", 1, 0.0, None, "", cli="codex", failure_class="rate_limit"))
+                raised = None
+            except Exception as e:  # noqa: BLE001
+                raised = e
+            last = json.loads(relay.LEDGER.read_text(encoding="utf-8").splitlines()[-1])
+            check("record()：rate_limit 不 raise，照常記進 STATE 與帳本", raised is None and r.state.calls[-1]["failure_class"] == "rate_limit"
+                  and last["failure_class"] == "rate_limit" and len(relay.LEDGER.read_text(encoding="utf-8").splitlines()) == n0 + 1, repr(raised))
+
+            # ---- 真的 implement()：attempt=1 的紀錄檔名（1 項；假 claude 吐真樣本，不呼叫 AI CLI）--------------------------
+            wt2 = d / "wt_real"
+            wt2.mkdir()
+            (d / "fake_claude.py").write_text(FAKE_CLAUDE, encoding="utf-8")
+            fx = relay.HERE / "fixtures" / "claude_stream_ok.stdout.txt"
+
+            def fake_build(cli, wt_, out_last, model=None, effort=None):
+                real = orig_build(cli, wt_, out_last, model=model, effort=effort)
+                return relay.ImplCmd([sys.executable, str(d / "fake_claude.py"), str(fx), str(d)], real.prefix, real.line_fn, real.drop_env)
+
+            relay.build_impl_command = fake_build
+            r = relay.Run({"id": "_test_handoff_real", "worktree": str(wt2), "repo": str(wt2), "spec_file": str(d / "A" / "spec.md"),
+                           "implementer": ["codex", "claude"]}, dry=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok, _, _ = r.implement(1, relay.HANDOFF_NOTE.format(prev="Codex"), cli="claude", attempt=1)
+            names = {p.name for p in r.dir.iterdir()}
+            want = {f"impl_r1_h1_claude{x}" for x in (".stdout.txt", ".stderr.txt", ".exit.txt", "_prompt.md")}
+            check("真 implement(cli=claude, attempt=1)：紀錄檔 impl_r1_h1_claude.*（stdout／stderr／exit／prompt），不寫 impl_r1.*",
+                  ok and want <= names and not any(n.startswith(("impl_r1.", "impl_r1_prompt")) for n in names), str(sorted(names)))
+        finally:
+            notify.notify, relay.build_impl_command = orig_notify, orig_build
+            relay.LEDGER = orig_ledger
+            for t in tids:
+                rm_runs(t)
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -1511,7 +1827,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram, test_resume, test_impl_command):
+                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()

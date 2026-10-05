@@ -60,16 +60,24 @@ def compose(kind: str, task_id: str, info: dict) -> str:
         l1 = f"【relay】{task_id} 審查工具故障（{i.get('failure_class') or '未分類'}）：實作與驗證已完成、未 commit"
         l2 = "下一步：修好審查工具（常見＝登入過期）後照 README 補審，不必重跑整棒"
     elif kind == "rate_limit":
-        l1 = f"【relay】{task_id} 撞牆停下：{i.get('cli') or '?'} 回 rate_limit"
-        l2 = "下一步：等額度恢復或改用另一支 CLI；worktree 保留"
+        # 2026-10-05（C5）：撞牆改走 escalate 出口。實作者撞牆＝清單裡每一支都撞了（cli 可能是「codex、claude」）；
+        # 審查者撞牆不換別家審（決策 D10）。兩者都能等額度恢復後 --resume 接續，第 2 行直接給指令
+        who = ("審查者 " if i.get("role") == "reviewer" else "") + str(i.get("cli") or "?")
+        l1 = f"【relay】{task_id} 撞牆停下：{who} 回 rate_limit"
+        l2 = f"下一步：等額度恢復後重跑，或寫 runs/{task_id}/human_notes.md 後 relay.py --resume {task_id}；worktree 保留未 commit"
     else:  # aborted
         l1 = f"【relay】{task_id} 中止：{str(i.get('reason') or '?')[:60]}"
         l2 = f"下一步：看 runs/{task_id}/relay.log 末段"
     # 單行化：訊息裡不留 \r／\n，避免第 1 行被原因文字截斷成兩行
     l1 = " ".join(l1.split())
     lines = [l1, l2]
+    l3 = []
     if i.get("minutes") is not None:
-        lines.append(f"耗時 {i['minutes']} 分")
+        l3.append(f"耗時 {i['minutes']} 分")
+    if i.get("handoff"):  # C5（2026-10-05）：這一棒途中撞牆換手過，例如「途中 codex→claude 換手」
+        l3.append(f"途中 {i['handoff']} 換手")
+    if l3:
+        lines.append("；".join(l3))
     return "\n".join(lines)
 
 

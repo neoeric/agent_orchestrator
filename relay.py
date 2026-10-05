@@ -4,7 +4,8 @@
 
 依「多 Agent 協作方案 v3」與 2026-09-07 目標 repo 重構六組的手動實跑固化而成。一棒＝：
   1. 從 base_branch 開隔離 worktree（生產目錄永遠不碰），跑 repo 級前置步驟（例如建 gitignore 的 views/）
-  2. 實作者（Codex 或 Claude Code，task 的 implementer）依「完全指定」的規格改碼；不 commit
+  2. 實作者（Codex 或 Claude Code，task 的 implementer）依「完全指定」的規格改碼；不 commit。
+     implementer 寫成清單＝judge 判 rate_limit 時同一輪依序換手（C5：不消耗輪數、只限本棒、不下架任何 Agent）
   3. 驗證指令逐條在 worktree 跑，全部 exit 0 才算過（最終事實來源＝測試，不是 CLI 的自我回報）
   4. 審查者（Antigravity agy，唯讀、diff 分塊內嵌）看 diff，回「可合併／需修改」＋未申報問題
   5. 判定器（judge.py）核對每一次 CLI 呼叫真的正常結束；驗證或審查不過 → 把發現餵回實作者再來一輪
@@ -20,8 +21,8 @@
   PYTHONUTF8=1 python relay.py tasks/<task>.json --queue    # 並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊
   PYTHONUTF8=1 python relay.py --status [--all]             # 所有棒的階段、輪次、耗時、是否等人
   PYTHONUTF8=1 python relay.py --resume <task_id> [--rounds N]  # 人工意見回灌：讀 runs/<id>/human_notes.md 接續下一輪
-離開碼：0＝收斂並已 commit；2＝不收斂／被擋，已寫 HANDOFF 給人；3＝參數／環境錯、被鎖擋下拒跑、或例外中止
-（STATE 記 aborted）；130＝Ctrl-C。
+離開碼：0＝收斂並已 commit；2＝不收斂／被擋（含撞牆：可用的實作者都回 rate_limit、或審查者回 rate_limit），
+已寫 HANDOFF 給人；3＝參數／環境錯、被鎖擋下拒跑、或例外中止（STATE 記 aborted）；130＝Ctrl-C。
 """
 from __future__ import annotations
 
@@ -41,7 +42,7 @@ import unicodedata
 from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import MISSING, dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,7 +55,8 @@ from tools import iface_gate, inject_check, notify, paths, runlock  # noqa: E402
 VERIFY_TIMEOUT_DEFAULT = 1800
 # 2026-10-05：「新增但不算改動」的未追蹤路徑前綴預設值，changed_paths 與送審判準兩處共用。
 IGNORE_NEW_DEFAULT = ["_refactor/", "views/", "__pycache__"]
-# P4：跨任務用量帳本（只記帳，不換手）。2026-10-05：可由 RELAY_LEDGER 覆寫（多行程併寫測試用），預設不變。
+# P4：跨任務用量帳本。2026-10-05：可由 RELAY_LEDGER 覆寫（多行程併寫測試用），預設不變；
+# C5 起另供換手冷卻「唯讀查詢」（handoff_cooldown_minutes，預設 0＝關），relay 不據以寫任何停用清單。
 LEDGER = Path(os.environ.get("RELAY_LEDGER") or HERE / "runs" / "usage_ledger.jsonl")
 
 # ---- C3（2026-10-05）：並行鎖。鎖檔都在 runs/.locks/（runs/ 已 gitignore），語意見 tools/runlock.py。
@@ -75,14 +77,6 @@ NOTIFY_LEDGER = HERE / "runs" / "notify_ledger.jsonl"
 def notify_config_path() -> Path:
     """每次呼叫才讀環境變數（不在 import 時固定），測試與臨時換設定才有效。"""
     return Path(os.environ.get("RELAY_NOTIFY_CONFIG") or HERE / "notify.json")
-
-
-class RateLimitStop(RuntimeError):
-    """撞牆（CLI 回 rate_limit）。獨立型別是為了讓 main() 以 kind="rate_limit" 中止並推播；仍是 RuntimeError，既有 except 照舊接得到。"""
-
-    def __init__(self, msg: str, cli: str = "") -> None:
-        super().__init__(msg)
-        self.cli = cli
 
 
 class ProductionTouched(RuntimeError):
@@ -106,6 +100,13 @@ IMPL_NAMES = {"codex": "Codex", "claude": "Claude Code"}   # 給人看的名字�
 CLAUDE_IMPL_TOOLS = "Read,Edit,Write,Glob,Grep"
 # --effort 的合法值，來源：claude --help（2.1.246）。task 寫錯在啟動時就擋，不要等 CLI 回錯再白燒一輪
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# ---- C5（2026-10-05）：撞牆換手（只限實作者）--------------------------------------------------------
+# 換手時 worktree 不重置（決策 D9：不做破壞性操作，verify＋審查才是裁判），所以要明講「可能有半成品」，
+# 否則接手者會從頭重寫、或把半成品當成既有程式碼繞開。結尾的空行是 impl_prompt 切開說明與其餘發現的界線
+HANDOFF_NOTE = ("【換手說明】前一位實作者（{prev}）在本輪中途因額度限制停止，worktree 可能已有部分改動。"
+                "請先唯讀檢查現有改動，再依規格完成；已正確完成的部分不要重做。\n\n")
+RATE_LIMIT_VERDICTS = ("rate_limit", "reviewer_rate_limit")   # 撞牆停下的兩種 verdict：exit 2、推播 kind rate_limit
 
 # 2026-10-05（C4a）：本機路徑改成執行時的 {HERE}（原本寫死開發機路徑＝PUBLIC repo 洩漏、也不可攜）
 IMPL_RULES = f"""【守則，違反即整棒作廢】
@@ -171,6 +172,8 @@ def ledger_append(entry: dict) -> None:
 
 
 def ledger_totals() -> dict:
+    """各 CLI 的累計。C5（2026-10-05）加 last_rate_limit：最後一筆 rate_limit 的 ts 原字串（沒有＝None）。
+    帳本只 append（並行時也在鎖內），檔案順序＝時間順序，所以取最後出現的那筆，不必解析 ts。"""
     tot: dict = {}
     if not LEDGER.exists():
         return tot
@@ -180,13 +183,59 @@ def ledger_totals() -> dict:
         except json.JSONDecodeError:
             continue
         u = e.get("usage") or {}
-        t = tot.setdefault(e.get("cli", "?"), {"calls": 0, "input_total": 0, "output": 0, "seconds": 0.0, "rate_limited": 0})
+        t = tot.setdefault(e.get("cli", "?"), {"calls": 0, "input_total": 0, "output": 0, "seconds": 0.0, "rate_limited": 0,
+                                               "last_rate_limit": None})
         t["calls"] += 1
         t["input_total"] += int(u.get("input_tokens_total") or 0)
         t["output"] += int(u.get("output_tokens") or 0)
         t["seconds"] += float(e.get("seconds") or 0)
-        t["rate_limited"] += 1 if e.get("failure_class") == "rate_limit" else 0
+        if e.get("failure_class") == "rate_limit":
+            t["rate_limited"] += 1
+            t["last_rate_limit"] = e.get("ts") or t["last_rate_limit"]
     return tot
+
+
+def ledger_recent_rate_limits(now: datetime, minutes: int, ledger: Path | None = None) -> dict[str, datetime]:
+    """C5（2026-10-05）：帳本裡 minutes 分鐘內、各 CLI 最近一次 rate_limit 的時間 {cli: ts}（換手冷卻用，決策 D8 預設關）。
+    🔴 紅線：純讀。冷卻是每棒開始時由帳本「即時計算」的時間窗，不落檔、不維護任何停用清單——程式永不下架任何 Agent。
+    now 要帶時區；minutes<=0 直接回 {}（不讀檔）；ts 解析失敗、不是物件的行略過；比 now 新的 ts（時鐘被調過）也算在窗內。
+    ledger 預設是呼叫當下的 LEDGER（不在定義時綁定：測試會換掉 relay.LEDGER）。
+    ponytail：每次讀整份帳本，O(n)、n＝歷史呼叫數（目前百筆級）；上萬筆時改成從檔尾倒讀到超出時間窗為止。"""
+    if minutes <= 0:
+        return {}
+    try:
+        lines = (LEDGER if ledger is None else ledger).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    window, out = timedelta(minutes=minutes), {}
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("failure_class") != "rate_limit":
+            continue
+        cli, ts = e.get("cli"), _parse_ts(e.get("ts"))
+        if not isinstance(cli, str) or not cli or ts is None:
+            continue
+        if now - ts <= window and (cli not in out or ts > out[cli]):
+            out[cli] = ts
+    return out
+
+
+def pick_implementer(order: list[str], cooling: set[str], recent: dict[str, datetime], cooldown_min: int) -> str | None:
+    """C5（2026-10-05）：這一次實作用誰（純函式）。
+    1) 排除 cooling（本棒內撞過牆的）；全被排除 → None（呼叫端停下、verdict rate_limit）。
+    2) cooldown_min>0 時跳過 recent 裡的 CLI；若因此全部被跳過 → 回第 1 步剩下的第一個
+       （帳本冷卻只是建議，永不讓任務無人可用）。"""
+    avail = [c for c in order if c not in cooling]
+    if not avail:
+        return None
+    if cooldown_min > 0:
+        fresh = [c for c in avail if c not in recent]
+        if fresh:
+            return fresh[0]
+    return avail[0]
 
 
 
@@ -232,6 +281,9 @@ class State:
     resumed: list = field(default_factory=list)   # 每次 resume 一筆 {"ts","from_round","first_round","rounds","notes_sha256",…}
     commits: list = field(default_factory=list)   # relay 在這個 branch 上疊過的每一顆 commit；commit 欄＝最新一顆
     implementer: str = ""     # C4a（2026-10-05）：最近一次實作者呼叫用的 CLI（codex／claude）；舊 STATE 沒有＝""
+    # C5（2026-10-05）：每次換手／跳過一筆 {"round","from","to","reason","ts",…}；reason＝rate_limit（同輪換手）、
+    # cooling（本棒已撞過牆而略過）、cooldown（帳本冷卻窗內而略過）。只是紀錄：relay 從不讀它來決定下一棒用誰
+    handoffs: list = field(default_factory=list)
 
 
 def state_from_dict(d) -> State:
@@ -263,6 +315,25 @@ def state_from_dict(d) -> State:
 
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def implementer_order(task: dict) -> list[str]:
+    """task 的 implementer → 換手順序清單（C5，2026-10-05）。字串＝長度 1（不換手）；省略＝["codex"]。
+    合法性由 load_task 擋；回新清單，不和 task 共用（紅線：relay 不改 task 的任何內容）。"""
+    impl = task.get("implementer", "codex")
+    return [impl] if isinstance(impl, str) else list(impl)
+
+
+def impl_stem(rnd: int, attempt: int = 0, cli: str = "") -> str:
+    """實作者紀錄檔的檔名主幹（prompt／stdout／stderr／exit／last_message 共用）。
+    C5（2026-10-05）：attempt>0＝同一輪換手後的第 attempt 次呼叫 → impl_r{rnd}_h{attempt}_{cli}，不覆蓋第一次的紀錄。"""
+    return f"impl_r{rnd}" + (f"_h{attempt}_{cli}" if attempt else "")
+
+
+def has_rate_limit_fixture(cli: str) -> bool:
+    """fixtures/ 有沒有這支 CLI 的 rate_limit 真樣本（檔名慣例 <cli>_rate_limit.*）。C5（2026-10-05）：真 429 至今
+    未觀察到，各家判定都沒有真樣本；沒有時 relay 在撞牆當下提示人把原始輸出收進來，收了之後就不再嘮叨。"""
+    return any((HERE / "fixtures").glob(f"{cli}_rate_limit*"))
 
 
 def sh(cmd: list[str], cwd: str | None = None, timeout: int = 900, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -650,7 +721,13 @@ class Run:
         self.review_extra = ""  # resume 時附在審查核對條件後面的人工追加要求
         self.wt = task["worktree"]
         self.repo = task["repo"]
-        self.impl_cli = task.get("implementer", "codex")  # C4a：合法值由 load_task 擋（寫錯 exit 3，不再靜默用 codex）
+        # C4a：合法值由 load_task 擋（寫錯 exit 3，不再靜默用 codex）。C5：清單＝撞牆時依序換手；impl_cli＝第一順位
+        self.impl_order = implementer_order(task)
+        self.impl_cli = self.impl_order[0]
+        # 🔴 C5 紅線（2026-10-05）：本棒內撞過牆的 CLI 只活在這個 Run 物件的記憶體裡——不寫 task 檔、設定檔或任何
+        # 停用清單；下一棒是新的 Run，一定從空集合、從第一順位開始。程式永不自動下架任何 Agent
+        self.cooling: set[str] = set()
+        self._handoffs_from = len(self.state.handoffs)  # 推播／commit 訊息只講這一次執行的換手（resume 會帶著舊紀錄）
 
     # ---- 狀態檔 ------------------------------------------------------------
     def save(self, phase: str | None = None) -> None:
@@ -665,26 +742,26 @@ class Run:
         (self.dir / "CURRENT.md").write_text(text, encoding="utf-8")
 
     def record(self, rec: CallRecord) -> None:
+        """記一次 CLI 呼叫（STATE＋帳本）。C5（2026-10-05）起遇到 rate_limit 不再 raise：由 run() 看 failure_class
+        決定換手（實作者）或停下（審查者），撞牆一律走 escalate 出口（exit 2），不再當例外中止（exit 3）。"""
         self.state.calls.append(asdict(rec)); self.save()
         ledger_append({"ts": now(), "task": self.t["id"], "role": rec.role, "cli": rec.cli, "round": rec.round,
                        "ok": rec.ok, "failure_class": rec.failure_class, "seconds": rec.seconds, "usage": rec.usage})
-        if rec.failure_class == "rate_limit":
-            # P4 只偵測不換手：真正的 429 至今未直接觀察到，先讓它大聲停下來
-            raise RateLimitStop(f"撞牆：{rec.cli} 回 rate_limit（{rec.reason}）。本版不自動換手，請人決定換誰。", cli=rec.cli)
 
     def log(self, msg: str, prefix: str = "RELAY") -> None:
         emit(prefix, msg, self.dir / "relay.log")
 
-    def abort(self, reason: str, notify: bool = True, kind: str = "aborted", **info) -> None:
+    def abort(self, reason: str, notify: bool = True) -> None:
         """例外中止也要落檔（2026-10-05，C1）：以前 RuntimeError 由 main() 接住後不寫 STATE，階段停在中止前
         那格（例如 review），--status 看起來像還在跑。C2：notify=True 時 STATE／CURRENT 都寫完才推播；
-        KeyboardInterrupt（人在場）呼叫端傳 notify=False。kind 讓撞牆走自己的文案。"""
+        KeyboardInterrupt（人在場）呼叫端傳 notify=False。C5（2026-10-05）起撞牆不再走這裡（改走 run() 的
+        escalate 出口），原本給撞牆用的 kind 參數已拿掉。"""
         self.state.abort_reason = reason[:500]
         self.save("aborted")
         self.write_current(f"# CURRENT\n\n任務 {self.t['id']} 中止：{reason[:500]}；看 relay.log。\n")
         self.log(f"任務中止：{reason[:500]}")
         if notify:
-            self.notify(kind, reason=reason, **info)
+            self.notify("aborted", reason=reason)
 
     def notify(self, kind: str, **info) -> None:
         """C2（2026-10-05）：在「需要人」的出口推播，且一棒最多一則。dry-run／--no-notify／已發過都直接略過。
@@ -696,7 +773,7 @@ class Run:
             started = _parse_ts(_segment_start(asdict(self.state)))  # C6：resume 的棒只算這一次接續的耗時
             minutes =int((datetime.now(timezone.utc) - started).total_seconds() // 60) if started else None
             info = {"round": self.state.round, "max_rounds": self.state.max_rounds, "commit": self.state.commit,
-                    "branch": self.state.branch, "minutes": minutes, **info}
+                    "branch": self.state.branch, "minutes": minutes, "handoff": self.handoff_summary(), **info}
             result = notify.notify(kind, self.t["id"], info, config_path=notify_config_path(), ledger_path=NOTIFY_LEDGER,
                                    lock_path=LOCKS / "notify.lock")
         except Exception as e:  # ponytail: 連 notify 自己的 bug 也吞掉；代價是推播可能靜默沒發，relay.log 會留這行
@@ -712,6 +789,16 @@ class Run:
                     f.write(f"\n{result}\n")
             except OSError:
                 pass
+
+    def handoff_summary(self) -> str:
+        """這一次執行裡的同輪換手，例如 "codex→claude"；沒有＝""（C5，2026-10-05）。推播第 3 行與 commit 訊息用。
+        只算 reason=rate_limit 的真換手；略過（cooling／cooldown）不算，那些在 HANDOFF.md 的換手紀錄看得到。"""
+        return "、".join(f"{h.get('from')}→{h.get('to')}" for h in self.state.handoffs[self._handoffs_from:]
+                         if isinstance(h, dict) and h.get("reason") == "rate_limit")
+
+    def walled_clis(self) -> list[str]:
+        """本棒撞過牆的實作者，依偏好順序（blocker 與推播用）。"""
+        return [c for c in self.impl_order if c in self.cooling]
 
     def note_interrupted_previous(self) -> None:
         """拿到任務鎖之後呼叫（2026-10-05，C3）：上一次的 STATE 停在非終態＝那個行程沒收尾就不在了
@@ -791,15 +878,21 @@ class Run:
         self.save("prepared")
 
     # ---- 2. 實作者 -----------------------------------------------------------
-    def impl_prompt(self, rnd: int, feedback: str) -> str:
-        """組實作者 prompt 並落檔 impl_r{rnd}_prompt.md（2026-10-05 從 implement 抽出：測試替身與真實作共用同一份組法）。"""
+    def impl_prompt(self, rnd: int, feedback: str, stem: str | None = None) -> str:
+        """組實作者 prompt 並落檔 {stem}_prompt.md（預設 impl_r{rnd}_prompt.md；2026-10-05 從 implement 抽出：
+        測試替身與真實作共用同一份組法）。C5：換手時 stem 帶 _h{attempt}_{cli}，不覆蓋第一次的 prompt。"""
         spec = Path(self.t["spec_file"]).read_text(encoding="utf-8")
         prompt = IMPL_RULES + "\n【規格】\n" + spec
+        if feedback.startswith("【換手說明】"):
+            # C5：換手說明自成一段放最前面；其餘（上一輪發現／人工意見）照下面原本的規則加標題，
+            # 不然「【上一輪審查／驗證的發現…】」的帽子會蓋在換手說明上、第一輪換手時還會變成空標題
+            note, _, feedback = feedback.partition("\n\n")
+            prompt += "\n\n" + note
         if feedback:
             # C6：resume 第一輪的 feedback 自帶「【人工審查意見…】」標題，不再套「上一輪審查」的帽子
             head = "" if feedback.startswith("【人工審查意見") else "【上一輪審查／驗證的發現，請逐條修正後再回報】\n"
             prompt += "\n\n" + head + feedback
-        (self.dir / f"impl_r{rnd}_prompt.md").write_text(prompt, encoding="utf-8")
+        (self.dir / f"{stem or impl_stem(rnd)}_prompt.md").write_text(prompt, encoding="utf-8")
         return prompt  # C4a（2026-10-05）起 prompt 走 stdin，C6 那條「超過 30,000 字元命令列放不下」的警告已拿掉
 
     def guarded_implement(self, rnd: int, feedback: str, cli: str | None = None, attempt: int = 0):
@@ -832,11 +925,74 @@ class Run:
                                     f"{snapshot_delta(before, after or '')}。請人工檢查生產目錄；"
                                     "若是別的 session／服務同時寫入造成的誤報，確認後重跑即可")
 
+    # ---- 2b. 換手（C5，2026-10-05）--------------------------------------------------------------
+    # 🔴 紅線（README「換手」同）：冷卻只存在於 (a) 本棒記憶體 self.cooling、(b) 每棒開始時由帳本即時計算的時間窗；
+    # 這一段永不寫 task 檔、設定檔或任何「停用清單」，每次跳過／換手都印一行 [JUDGE] 並記入 state.handoffs。
+    def pick_cli(self, rnd: int, recent: dict[str, datetime], cd: int) -> str | None:
+        """這一輪的第一位實作者（pick_implementer）；被略過的每一支都印 [JUDGE] 並記一筆 state.handoffs。"""
+        cli = pick_implementer(self.impl_order, self.cooling, recent, cd)
+        if cli is None:
+            return None
+        for c in self.impl_order[:self.impl_order.index(cli)]:
+            if c in self.cooling:
+                entry, why = {"reason": "cooling"}, f"{c} 本棒已回過 rate_limit（只限本棒）"
+            else:
+                ts = recent[c].strftime("%Y-%m-%dT%H:%M:%S%z")
+                entry = {"reason": "cooldown", "last_rate_limit": ts}
+                why = f"{c} 於 {ts} 回過 rate_limit，在 {cd} 分帳本冷卻窗內（即時計算的建議）"
+            self.state.handoffs.append({"round": rnd, "from": c, "to": cli, **entry, "ts": now()})
+            self.log(f"略過 {c}，本輪實作者用 {cli}：{why}；不下架任何 Agent，下一棒仍從 {self.impl_order[0]} 開始", prefix="JUDGE")
+        avail = [c for c in self.impl_order if c not in self.cooling]
+        if cd > 0 and all(c in recent for c in avail):
+            self.log(f"帳本冷卻：可用的實作者 {'、'.join(avail)} 都在 {cd} 分內回過 rate_limit，仍用 {cli}"
+                     "（冷卻只是建議，永不讓任務無人可用）", prefix="JUDGE")
+        return cli
+
+    def log_rate_limit(self, call: dict) -> None:
+        """撞牆當下的 [JUDGE] 一行：原始輸出在哪；fixtures/ 還沒有該 CLI 的真樣本時，提示人確認後收進去。"""
+        cli = call.get("cli") or "?"
+        hint = "" if has_rate_limit_fixture(cli) else (
+            f"——fixtures/ 還沒有 {cli} 的 rate_limit 真樣本（真 429 至今未觀察到）：請人工確認這份輸出真的是額度限制，"
+            f"再照 fixtures/README.md 收成 fixtures/{cli}_rate_limit.*，並補判定器契約測試")
+        self.log(f"🔴 {cli} 回 rate_limit（{call.get('reason')}）；原始輸出 {call.get('stdout_file') or '?'}{hint}", prefix="JUDGE")
+
+    def implement_with_handoff(self, rnd: int, feedback: str, recent: dict[str, datetime], cd: int) -> tuple[bool, str]:
+        """一輪的實作者呼叫＋撞牆換手。judge 判 rate_limit → 該 CLI 進本棒 cooling，同一輪改由下一順位接手：
+        不消耗輪數（每輪最多 len(impl_order)-1 次）、worktree 不重置（D9：半成品保留，HANDOFF_NOTE 告知接手者）。
+        可用的都撞牆 → state.verdict="rate_limit"，呼叫端停下（exit 2）。其他失敗類型照舊交給呼叫端「下一輪重試」。"""
+        cli = self.pick_cli(rnd, recent, cd)
+        if cli is None:  # 防呆：全部撞牆時上一輪就已停下，照理到不了這裡
+            self.state.verdict = "rate_limit"
+            return False, ""
+        ok, report, _ = self.guarded_implement(rnd, feedback, cli=cli)
+        attempt = 0
+        while not ok and not self.dry:
+            last = self.state.calls[-1] if self.state.calls else {}
+            if last.get("role") != "implementer" or last.get("failure_class") != "rate_limit":
+                break
+            self.cooling.add(cli)
+            self.log_rate_limit(last)
+            nxt = pick_implementer(self.impl_order, self.cooling, {}, 0)
+            if nxt is None:
+                self.state.verdict = "rate_limit"
+                self.log(f"可用的實作者都撞牆（{'、'.join(self.walled_clis())}），停下給人；"
+                         "不下架任何 Agent，額度恢復後重跑仍從第一順位開始", prefix="JUDGE")
+                return False, report
+            self.state.handoffs.append({"round": rnd, "from": cli, "to": nxt, "reason": "rate_limit", "ts": now(),
+                                        "stdout_file": last.get("stdout_file") or ""})
+            self.save()
+            self.log(f"換手：{cli} → {nxt}（同一輪、不消耗輪數、worktree 不重置；只限本棒，下一棒仍從 "
+                     f"{self.impl_order[0]} 開始，不下架任何 Agent）", prefix="JUDGE")
+            prev, cli, attempt = cli, nxt, attempt + 1
+            ok, report, _ = self.guarded_implement(rnd, HANDOFF_NOTE.format(prev=IMPL_NAMES.get(prev, prev)) + feedback,
+                                                   cli=cli, attempt=attempt)
+        return ok, report
+
     def implement(self, rnd: int, feedback: str, cli: str | None = None, attempt: int = 0) -> tuple[bool, str, dict | None]:
-        """呼叫實作者一次（C4a 起 codex｜claude 可插拔；prompt 一律走 stdin）。attempt>0 是同一輪換手（C5 才會用）。"""
+        """呼叫實作者一次（C4a 起 codex｜claude 可插拔；prompt 一律走 stdin）。attempt>0 是同一輪換手（C5）。"""
         cli = cli or self.impl_cli
-        prompt = self.impl_prompt(rnd, feedback)
-        stem = f"impl_r{rnd}" + (f"_a{attempt}" if attempt else "")
+        stem = impl_stem(rnd, attempt, cli)
+        prompt = self.impl_prompt(rnd, feedback, stem=stem)
         out_last = self.dir / f"{stem}_last_message.md"
         so, se, ex = (self.dir / f"{stem}.{k}.txt" for k in ("stdout", "stderr", "exit"))
         ic = build_impl_command(cli, self.wt, out_last, model=(self.t.get("implementer_models") or {}).get(cli),
@@ -1037,8 +1193,23 @@ class Run:
         usage_lines = []
         for c in self.state.calls:
             u = c["usage"] or {}
-            usage_lines.append(f"- round {c['round']} {c['role']}: {'OK' if c['ok'] else 'FAIL'} {c['seconds']}s, "
-                               f"input_total={u.get('input_tokens_total')} output={u.get('output_tokens')}")
+            # C5：同一輪可能有兩次實作者呼叫（換手），附上 CLI 與失敗類別才分得出誰是誰
+            usage_lines.append(f"- round {c['round']} {c['role']}（{c.get('cli') or '?'}）: "
+                               f"{'OK' if c['ok'] else 'FAIL' + (' ' + c['failure_class'] if c.get('failure_class') else '')} "
+                               f"{c['seconds']}s, input_total={u.get('input_tokens_total')} output={u.get('output_tokens')}")
+        handoff_line = ""
+        if self.state.handoffs:  # C5：「用量」節前一行換手紀錄（無則省略）
+            items = []
+            for h in self.state.handoffs:
+                if h.get("reason") == "rate_limit":
+                    items.append(f"round {h.get('round')} {h.get('from')}→{h.get('to')}（{h.get('from')} 回 rate_limit；"
+                                 f"原始輸出 `{h.get('stdout_file') or '?'}`"
+                                 f"{'' if has_rate_limit_fixture(str(h.get('from'))) else '，若是第一個真樣本請確認後收進 fixtures/'}）")
+                elif h.get("reason") == "cooldown":
+                    items.append(f"round {h.get('round')} 略過 {h.get('from')} 改用 {h.get('to')}（帳本冷卻：{h.get('last_rate_limit')} 回過 rate_limit）")
+                else:
+                    items.append(f"round {h.get('round')} 略過 {h.get('from')} 改用 {h.get('to')}（本棒已撞牆）")
+            handoff_line = "換手紀錄：" + "；".join(items) + "（只限該棒；不下架任何 Agent）\n\n"
         resumed = ""
         if self.state.resumed:  # C6：上一版 HANDOFF 已存成 HANDOFF.r{N}.md，這裡說清楚這份是第幾次接續
             r0 = self.state.resumed[-1]
@@ -1079,7 +1250,7 @@ class Run:
 {chr(10).join('  - ' + k + ': ' + '; '.join(v['breaking'] + v['additive']) for k, v in self.state.iface_gate.items() if v['breaking'] or v['additive']) or ''}
 - 審查者結構化判定：{[d.get('approved') for d in self.state.review_decisions if 'approved' in d] or '（未送審）'}；未申報問題：{[d.get('unreported') for d in self.state.review_decisions if 'approved' in d] or '—'}
 
-## 用量（每次呼叫，判定器抽取）
+{handoff_line}## 用量（每次呼叫，判定器抽取）
 {chr(10).join(usage_lines)}
 - 帳本累計（所有任務，runs/usage_ledger.jsonl）：{json.dumps(ledger_totals(), ensure_ascii=False)}
 
@@ -1096,7 +1267,9 @@ class Run:
     # ---- 主流程 --------------------------------------------------------------
     def run(self, start_round: int = 1, rounds: int | None = None, initial_feedback: str = "", resume: bool = False) -> int:
         """跑一棒。C6（2026-10-05）一般化：resume 時從 start_round 接續編號（r3、r4…，不覆蓋舊紀錄），
-        第一輪的 feedback＝人工意見（＋上一輪未解決的發現），不建 worktree、不跑 prebuild。"""
+        第一輪的 feedback＝人工意見（＋上一輪未解決的發現），不建 worktree、不跑 prebuild。
+        C5（2026-10-05）：實作者撞牆在同一輪換手（implement_with_handoff）；可用的實作者都撞牆或審查者撞牆
+        → verdict rate_limit／reviewer_rate_limit，走 escalate 出口回 2（不再丟例外、不再 exit 3）。"""
         self.log(f"任務 {self.t['id']}：{self.t.get('title', '')}")
         rounds = int(self.t.get("max_rounds", 2)) if rounds is None else rounds
         last = start_round + rounds - 1
@@ -1106,11 +1279,19 @@ class Run:
         # D11：已 commit 過的棒 resume → 在同一 branch 疊新 commit；審查看整個任務的累積 diff，commit 只收增量
         review_base = self.review_base() if (resume and self.state.commit and not self.dry) else ""
         feedback, impl_report, verify_summary, review_text, paths = initial_feedback, "", "", "", []
+        # C5（2026-10-05）：帳本冷卻窗每棒只算一次（決策 D8 預設 0＝關，不讀帳本）；本棒 cooling 在 __init__ 是空集合
+        cd = int(self.t.get("handoff_cooldown_minutes", 0))
+        recent = ledger_recent_rate_limits(datetime.now().astimezone(), cd)
+        if len(self.impl_order) > 1 or cd > 0:
+            self.log(f"實作者順序 {' → '.join(self.impl_order)}：judge 判 rate_limit 才同一輪換手（不消耗輪數、只限本棒）；"
+                     f"帳本冷卻 {f'{cd} 分' if cd else '關'}", prefix="JUDGE")
         for rnd in range(start_round, last + 1):
             self.state.round = rnd
             self.write_current(f"# CURRENT\n\n任務 {self.t['id']} round {rnd}/{last}：實作中。worktree `{self.wt}`。\n")
             self.save("implement")
-            ok, impl_report, _ = self.guarded_implement(rnd, feedback)
+            ok, impl_report = self.implement_with_handoff(rnd, feedback, recent, cd)
+            if self.state.verdict == "rate_limit":  # 可用的實作者都撞牆：停下給人（不再開下一輪）
+                break
             if not ok and not self.dry:
                 feedback = "實作者的 CLI 呼叫沒有正常結束（判定器：" + self.state.calls[-1]["reason"] + "）。請重做規格。"
                 self.state.last_feedback = feedback
@@ -1156,8 +1337,15 @@ class Run:
             self.save()
             if not tool_ok:
                 # 審查工具故障：停下來給人，不開下一輪（實作沒問題時再跑一輪只是燒錢）
-                self.state.verdict = "review_tool_failure"
-                self.log("審查工具故障，停止（不開下一輪）；修好 tools/agy_review.py 後重跑，或人工審查 review_r*_diff.txt")
+                rev = next((c for c in reversed(self.state.calls) if c.get("role") == "reviewer"), {})
+                if rev.get("failure_class") == "rate_limit":
+                    # C5 決策 D10：審查者撞牆不換別家審（換家會改變審查標準），停下推播
+                    self.state.verdict = "reviewer_rate_limit"
+                    self.log_rate_limit(rev)
+                    self.log("審查者撞牆，停止（不開下一輪、不換別家審）；等額度恢復後重跑或 --resume", prefix="JUDGE")
+                else:
+                    self.state.verdict = "review_tool_failure"
+                    self.log("審查工具故障，停止（不開下一輪）；修好 tools/agy_review.py 後重跑，或人工審查 review_r*_diff.txt")
                 break
             if v_ok and nc_ok and r_ok:
                 self.state.verdict = "converged"
@@ -1174,6 +1362,8 @@ class Run:
             again = f"；人工意見回灌第 {len(self.state.resumed)} 次" if self.resuming else ""
             # 決策 D15（2026-10-05）：拿掉寫死的 Co-Authored-By 行（以前把 Codex 的產出記成 Claude 共同作者），改在內文寫實際角色
             who = IMPL_NAMES.get(self.state.implementer or self.impl_cli, self.state.implementer or self.impl_cli)
+            hs = self.handoff_summary()  # C5：換手後 who＝實際的最後實作者，並註明途中換手
+            who += f"（途中 {hs} 換手）" if hs else ""
             msg = f"{self.t.get('title', self.t['id'])}\n\n（編排器 relay.py：{who} 實作、agy 審查、驗證指令全過；task {self.t['id']}{again}）\n"
             self.state.commit = self.commit(paths, msg)
             self.state.commits.append(self.state.commit)  # 不改寫既有 commit：同一 branch 上疊新的一顆
@@ -1188,18 +1378,34 @@ class Run:
             paths = self.changed_paths()
         except RuntimeError as e:
             paths = [f"（{e}）"]
-        if self.state.verdict == "review_tool_failure":
+        verdict, tid = self.state.verdict, self.t["id"]
+        walled = "、".join(self.walled_clis()) or "?"
+        rev_cli = next((c.get("cli") for c in reversed(self.state.calls) if c.get("role") == "reviewer"), None) or "agy"
+        if verdict == "review_tool_failure":
             blocker = (f"審查工具故障（round {self.state.round}：agy_review 沒有回傳 JSON／子行程崩潰）。實作與驗證結果見上；"
                        "修好 tools/agy_review.py 後重跑 relay，或人工審 review_r*_diff.txt，或寫 human_notes.md（例如「請照原樣，"
                        "只需重新審查」）後 `relay.py --resume` 接續；worktree 改動保留、未 commit。")
+        elif verdict == "rate_limit":  # C5：清單裡每一支實作者都撞牆
+            blocker = (f"`{walled}` 回 rate_limit：可用的實作者都撞牆（round {self.state.round}）；worktree 保留未 commit"
+                       f"（可能有實作者中途留下的半成品）。等額度恢復後重跑，或寫 human_notes.md 後 `relay.py --resume {tid}`。"
+                       f"relay 不下架任何 Agent：下一棒仍從 {self.impl_order[0]} 開始。")
+        elif verdict == "reviewer_rate_limit":  # C5 決策 D10：審查者撞牆停下，不換別家審
+            blocker = (f"審查者 `{rev_cli}` 回 rate_limit（round {self.state.round}；審查者撞牆不換別家審）。實作與驗證結果見上；"
+                       f"worktree 保留未 commit。等額度恢復後重跑，或寫 human_notes.md（例如「請照原樣，只需重新審查」）後 "
+                       f"`relay.py --resume {tid}`。")
         else:
             blocker = f"{self.state.round} 輪未收斂（驗證或審查不過），已停止；worktree 保留供人接手。"
         self.handoff("escalate", impl_report, verify_summary, review_text, paths, blocker)
-        self.write_current(f"# CURRENT\n\n任務 {self.t['id']} **未收斂**，已升給人。看 HANDOFF.md。\n")
-        self.log("未收斂，升給人")
-        if self.state.verdict == "review_tool_failure":
+        what = "撞牆停下" if verdict in RATE_LIMIT_VERDICTS else "未收斂"
+        self.write_current(f"# CURRENT\n\n任務 {tid} **{what}**，已升給人。看 HANDOFF.md。\n")
+        self.log(f"{what}，升給人")
+        if verdict == "review_tool_failure":
             fc = next((c.get("failure_class") for c in reversed(self.state.calls) if c.get("role") == "reviewer"), None)
             self.notify("review_tool_failure", failure_class=fc)
+        elif verdict == "rate_limit":
+            self.notify("rate_limit", cli=walled, role="implementer")
+        elif verdict == "reviewer_rate_limit":
+            self.notify("rate_limit", cli=rev_cli, role="reviewer")
         else:
             self.notify("escalate")
         return 2
@@ -1344,10 +1550,17 @@ def load_task(path: Path) -> dict:
     prod = task.get("production_dir")
     if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
         raise TaskError("worktree 不得等於生產目錄")
-    # C4a（2026-10-05）：以前 implementer 欄位從沒被讀過，寫什麼都靜默用 Codex；現在寫錯就 exit 3
+    # C4a（2026-10-05）：以前 implementer 欄位從沒被讀過，寫什麼都靜默用 Codex；現在寫錯就 exit 3。
+    # C5（2026-10-05）：也可以是不重複的非空清單＝撞牆時依序換手（重複沒有意義：撞過牆的本棒不會再用）
     impl = task.get("implementer", "codex")
-    if impl not in IMPLEMENTERS:
-        raise TaskError(f"implementer 不合法：{impl!r}（只能是 {' / '.join(IMPLEMENTERS)}；省略＝codex）")
+    order = [impl] if isinstance(impl, str) else impl
+    if not (isinstance(order, list) and order and all(isinstance(c, str) and c in IMPLEMENTERS for c in order)
+            and len(set(order)) == len(order)):
+        raise TaskError(f"implementer 不合法：{impl!r}（{' / '.join(IMPLEMENTERS)}，或不重複的清單如 "
+                        f"{json.dumps(list(IMPLEMENTERS))}＝撞牆時依序換手；省略＝codex）")
+    cd = task.get("handoff_cooldown_minutes", 0)
+    if isinstance(cd, bool) or not isinstance(cd, int) or cd < 0:
+        raise TaskError(f"handoff_cooldown_minutes 必須是 ≥0 的整數分鐘（0＝關，預設）；給的是 {cd!r}")
     for key, allowed in (("implementer_models", IMPLEMENTERS), ("implementer_effort", ("claude",))):
         v = task.get(key)
         if v is not None and not (isinstance(v, dict) and all(k in allowed and isinstance(x, str) and x.strip()
@@ -1362,8 +1575,9 @@ def load_task(path: Path) -> dict:
 def required_clis(task: dict) -> dict:
     """環境自檢要哪幾支 CLI（C4a，2026-10-05）→ paths.check_all 的 keyword 參數。
     以前一律要 codex＋agy：review.policy=never 也要求裝 agy（與 README 不符）、claude 實作者也要求裝 codex。
-    「用到的實作者」目前只有 implementer 一個；C5（list）／C4（candidates[*].implementer）落地時在這裡併入。"""
-    impl = {task.get("implementer", "codex")}
+    C5（2026-10-05）：implementer 清單裡的每一支都要在——換手的備援要能用，缺了要在開跑前大聲說，不是撞牆時才發現。
+    C4（candidates[*].implementer）落地時在這裡併入。"""
+    impl = set(implementer_order(task))
     return {"need_codex": "codex" in impl, "need_claude": "claude" in impl,
             "need_agy": task["review"].get("policy", "always") != "never"}
 
@@ -1479,7 +1693,7 @@ def main(argv=None) -> int:
     if a.ledger:
         for cli, t in ledger_totals().items():
             print(f"{cli:6s} calls={t['calls']} input_total={t['input_total']:,} output={t['output']:,} "
-                  f"seconds={t['seconds']:.0f} rate_limited={t['rate_limited']}")
+                  f"seconds={t['seconds']:.0f} rate_limited={t['rate_limited']} last_rate_limit={t['last_rate_limit'] or '-'}")
         return 0
     if a.status:
         print(status_report(None if a.all else STATUS_LIMIT))
@@ -1547,11 +1761,7 @@ def _execute(run: Run, task: dict, a, plan: ResumePlan | None = None) -> int:
         except KeyboardInterrupt:
             run.abort("使用者中斷", notify=False)
             return 130
-        except RateLimitStop as e:  # 撞牆：獨立 kind，文案是「等額度或換 CLI」；exit code 仍 3
-            print("relay 中止：", e, file=sys.stderr)
-            run.abort(str(e), kind="rate_limit", cli=e.cli)
-            return 3
-        except RuntimeError as e:  # relay 自己丟的中止：撞牆、worktree／prebuild 失敗、規格外改動、等 repo 鎖逾時…
+        except RuntimeError as e:  # relay 自己丟的中止：worktree／prebuild 失敗、規格外改動、等 repo 鎖逾時…（撞牆 C5 起走 run() 回 2）
             print("relay 中止：", e, file=sys.stderr)
             run.abort(str(e))
             return 3

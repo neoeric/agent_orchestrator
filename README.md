@@ -67,9 +67,10 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `repo` / `base_branch` / `branch` / `worktree` | 從 `base_branch` 開 `branch` 到 `worktree`；branch 已存在就沿用 |
 | `production_dir` | 選填但**強烈建議填**：`worktree` 等於它就直接拒跑，防手滑改到生產目錄。它是 git repo 時另有**生產目錄守門**：每次實作者呼叫前後各取一次快照（`git --no-optional-locks status --porcelain -z -uall`＋列出檔的大小／mtime＋HEAD），不同就整棒中止（exit 3、`aborted`）。被 `.gitignore` 的檔看不到；別的 session／服務在那段時間寫了生產目錄也會中止（誤報＝重跑一棒） |
 | `spec_file` | 給實作者的完全指定規格（相對路徑以編排器目錄為基準） |
-| `implementer` | `codex`（預設）或 `claude`；其他值（含寫錯、給 list）啟動時就 exit 3，不再靜默用 Codex。prompt 一律經 stdin 送，沒有命令列長度上限 |
+| `implementer` | `codex`（預設）或 `claude`；**可寫清單**如 `["codex", "claude"]`＝撞牆（judge 判 `rate_limit`）時依序換手（見「換手」）。其他值（含寫錯、空清單、重複）啟動時就 exit 3，不再靜默用 Codex；清單裡每一支都會在開跑前自檢。prompt 一律經 stdin 送，沒有命令列長度上限 |
 | `implementer_models` | 選填 `{"claude": "sonnet", "codex": "<model>"}`：各實作者用的模型；沒給＝該 CLI 自己的預設（claude 跟著你的 Claude Code 設定走，可能是最貴的那個） |
 | `implementer_effort` | 選填 `{"claude": "high"}`（`low`／`medium`／`high`／`xhigh`／`max`）；只接受 claude，寫錯 exit 3 |
+| `handoff_cooldown_minutes` | 選填，整數分鐘，預設 `0`（關）。>0 時，帳本裡這段時間內回過 `rate_limit` 的實作者，本棒一開始就先略過（只是建議：清單裡全都在窗內就照用第一個）；見「換手」 |
 | `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
 | `python` | 選填：verify／prebuild／陰性對照要用的 Python（例如專案 venv 的 `python.exe`）。沒設就用跑 relay 的那支直譯器；當 verify 需要的依賴只在專案 venv、而 relay 跑在別的 python 時設它（否則會拿到「缺依賴」的假紅燈）|
@@ -95,10 +96,13 @@ PYTHONUTF8=1 python relay.py tasks/my-task.json --dry-run   # 只印計畫，不
 PYTHONUTF8=1 python relay.py tasks/my-task.json --queue     # 並行名額滿了就排隊（見「並行」）
 PYTHONUTF8=1 python relay.py --status   # 所有棒的階段、輪次、耗時、是否等人（--all 看全部）
 PYTHONUTF8=1 python relay.py --resume my-task [--rounds N]   # 寫好 runs/my-task/human_notes.md 後接續下一輪（見「人工意見回灌」）
-PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
+PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量（含每支 CLI 最後一次 rate_limit 的時間）
 ```
 
 `PYTHONUTF8=1` 在 Windows 是必要的，否則輸出非 ASCII 會直接 cp950 crash。
+
+離開碼：`0`＝收斂並已 commit；`2`＝不收斂或被擋（含**撞牆**：可用的實作者都回 `rate_limit`、或審查者回 `rate_limit`），已寫 HANDOFF 給人；
+`3`＝參數／環境錯、被鎖擋下拒跑、或例外中止（STATE 記 `aborted`）；`130`＝Ctrl-C。
 
 `--status` 的「等人？」欄：`跑中`／`排隊中`（任務鎖有人持有）、`待合併 <commit>`、
 `要人看（未收斂／審查工具故障／撞牆／中止：原因）`、`中斷？（行程已不在）`（STATE 停在中途但任務鎖沒人持有＝
@@ -110,6 +114,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 1. 開隔離 worktree（拒絕等於 production_dir）
 2. prebuild
 3. 實作者（Codex／Claude Code）依 spec_file 改碼（不 commit）；前後比對生產目錄快照，有變動就中止
+   （implementer 是清單時：judge 判 rate_limit → 同一輪換下一位接手，不消耗輪數；見「換手」）
 4. verify[] 逐條跑，全部 exit 0 才算過
 4b. verify 全綠後跑 negative_controls：注入 → 必須紅在 marker → 還原
 5. 判準決定要不要送審 → agy 看 diff 唯讀審查，輸出結構化 verdict
@@ -155,13 +160,13 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 | 檔案 | 內容 |
 |---|---|
 | `CURRENT.md` | 接手的人第一眼看這份 |
-| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage；含中止原因，relay 被例外中止時階段記為 `aborted`；最後一輪未解決的發現（`last_feedback`）、每次 resume（`resumed`）、relay 疊過的每顆 commit（`commits`） |
+| `STATE.json` | 階段、輪次、每次 CLI 呼叫的 usage；含中止原因，relay 被例外中止時階段記為 `aborted`；最後一輪未解決的發現（`last_feedback`）、每次 resume（`resumed`）、relay 疊過的每顆 commit（`commits`）、最後實際用的實作者（`implementer`）、每次換手／略過（`handoffs`） |
 | `HANDOFF.md` | 六欄交接簿，含實作者與審查者原文 |
 | `human_notes.md` | 你寫的人工意見，`--resume` 用（見「人工意見回灌」）；用過改名成 `human_notes.r{N}.md` |
 | `HANDOFF.r{N}.md` | resume 前那一版 HANDOFF 的備份（N＝當時停在第幾輪） |
 | `relay.log` | 完整時序 |
-| `impl_r*` / `review_r*` / `verify_r*` | 每輪的 prompt、diff、審查指令、驗證輸出 |
-| `runs/usage_ledger.jsonl` | 跨任務帳本，每次呼叫一行（task／role／cli／usage／秒數／failure_class） |
+| `impl_r*` / `review_r*` / `verify_r*` | 每輪的 prompt、diff、審查指令、驗證輸出；同一輪換手後那次實作是 `impl_r{N}_h{k}_{cli}*`（不覆蓋第一次的紀錄） |
+| `runs/usage_ledger.jsonl` | 跨任務帳本，每次呼叫一行（ts／task／role／cli／usage／秒數／failure_class）；換手冷卻只**唯讀**查它 |
 | `runs/.locks/` | 並行鎖檔（空檔，不必手動刪；見「並行」） |
 | `runs/notify_ledger.jsonl` | 推播帳本，每次嘗試一行（見「需要人時才推播」） |
 
@@ -247,6 +252,26 @@ relay 不代為 checkout／reset，也**絕不從頭重跑**——狀態對不�
 - 從 `aborted` 接續（例如實作者動了規格外的檔）：worktree 裡可能還留著那些改動，請先自己處理，或在 notes 裡要求還原；relay 不代為 `git checkout`。
 - 實作者 prompt 經 stdin 送（2026-10-05 起），notes 再長也不受命令列 32K 上限影響。
 
+## 換手（選用）
+
+把 `implementer` 寫成清單（例如 `["codex", "claude"]`），某一支額度用完時由下一支接手，不必停下等人：
+
+- **只限實作者、只在 judge 判 `rate_limit` 時**。其他失敗（`auth`／`no_json`／`server`…）照舊「下一輪重試」，不換手。
+- **不消耗輪數**：同一輪改由下一順位重做，每輪最多換 `len(清單)-1` 次；換手那次的紀錄是 `impl_r{N}_h{k}_{cli}*`。
+- **半成品保留**：worktree **不重置**（不做破壞性操作；verify＋審查才是裁判）。接手者的 prompt 最前面多一段
+  「【換手說明】前一位實作者（…）在本輪中途因額度限制停止，worktree 可能已有部分改動…」。
+- **冷卻只是時間窗，不下架任何 Agent**：撞過牆的 CLI 只在**這一棒**的記憶體裡被略過；下一棒一定從清單第一個開始。
+  `handoff_cooldown_minutes`（預設 0＝關）>0 時，才會在每棒開始時由帳本**即時計算**「這段時間內撞過牆」的 CLI 先略過——
+  清單裡全都在窗內就照用第一個，永不讓任務無人可用。relay **永不寫** task 檔、設定檔或任何「停用清單」。
+- **每次換手／略過都看得到**：終端機與 `relay.log` 印一行 `[JUDGE]`，記進 `STATE.json` 的 `handoffs`，HANDOFF.md「用量」節前有
+  「換手紀錄：…」；收斂時 commit 訊息寫實際的最後實作者（例如「Claude Code（途中 codex→claude 換手） 實作」），推播第 3 行附「途中 codex→claude 換手」。
+- **撞牆停下**（exit 2、推播 kind `rate_limit`、`--status` 顯示「要人看（撞牆）」）：清單裡每一支都撞牆（verdict `rate_limit`），
+  或**審查者撞牆**（verdict `reviewer_rate_limit`；審查者不換別家審，換家會改變審查標準）。worktree 保留未 commit；
+  等額度恢復後重跑，或寫 `human_notes.md` 後 `--resume`。實作者只寫一個字串時，撞牆也是這樣停下（不換手）。
+- 🔴 **真的 429 至今還沒觀察到**：`judge.py` 各家的 `rate_limit` 判定都還沒有真樣本驗過。判定器若把別的錯誤誤分成
+  `rate_limit`，最壞是多燒一次另一支 CLI（且只在你寫了清單時）。**第一次遇到時**，`[JUDGE]` 那行會印原始輸出的路徑：
+  請人工確認它真的是額度限制，再照 `fixtures/README.md` 收成 `fixtures/<cli>_rate_limit.*` 並補判定器契約測試（收了之後提示就不再出現）。
+
 ## 需要人時才推播（選用）
 
 一棒常跑十幾分鐘到一小時，人不會一直盯著終端機。relay 可以在「需要你動手」時推播一則；**沒有設定檔就整個關閉**（預設零行為改變）。relay 不內建任何通道，只呼叫你指定的外部指令、經 **stdin（UTF-8）** 交訊息，日後換通道只改設定檔。
@@ -258,10 +283,10 @@ relay 不代為 checkout／reset，也**絕不從頭重跑**——狀態對不�
 | `ready_to_merge` | 收斂、已 commit，等你審後合併 | `【relay】<任務> 待合併：第 N 輪收斂，commit <hash>` |
 | `escalate` | 輪數用完仍未收斂（第 2 行提示可寫 `human_notes.md` 後 `--resume`） | `【relay】<任務> 未收斂：N/M 輪用完` |
 | `review_tool_failure` | 審查工具故障，實作與驗證已完成、未 commit | `【relay】<任務> 審查工具故障（<類別>）：…` |
-| `rate_limit` | CLI 回 rate_limit 撞牆 | `【relay】<任務> 撞牆停下：<cli> 回 rate_limit` |
+| `rate_limit` | 撞牆停下：清單裡每一支實作者都回 rate_limit，或審查者回 rate_limit（見「換手」） | `【relay】<任務> 撞牆停下：<cli>（或「審查者 agy」）回 rate_limit` |
 | `aborted` | 其他例外中止 | `【relay】<任務> 中止：<原因前 60 字>` |
 
-訊息最多三行：第 1 行講哪個任務、發生什麼，第 2 行以「下一步：」講要你做什麼（手機通知常只看得到前兩行），第 3 行是耗時。只陳述事實，不評價結果。
+訊息最多三行：第 1 行講哪個任務、發生什麼，第 2 行以「下一步：」講要你做什麼（手機通知常只看得到前兩行），第 3 行是耗時（途中換過手時附「途中 codex→claude 換手」）。只陳述事實，不評價結果。
 
 ### 設定
 
@@ -334,7 +359,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，68 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門，209 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手，245 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
@@ -436,6 +461,6 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 
 ## 還沒做
 
-- **換手**：實作者可選 codex／claude，但判定器回 `rate_limit` 時仍只會停下（不自動換另一家）；審查者固定 agy。
+- **審查者換手**：agy 撞牆只會停下推播，不會換別家審。
 - **批次啟動器**：並行要自己開兩個行程（每個行程自己守 RELAY_MAX_PARALLEL 名額），沒有一個指令跑一批的 launcher。
-- 帳本只記帳，沒有據以調度。
+- 帳本只用於換手冷卻（預設關），沒有做額度預算。
