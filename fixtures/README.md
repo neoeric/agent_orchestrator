@@ -1,7 +1,7 @@
 # fixtures — 三支 CLI 的真實回傳樣本（判定器契約測試用）
 
-**抓取時間** 2026-09-07 ｜ **機器** 本機（Windows 11，D:\Tooling）｜ **提示詞** 一律「回覆 OK」｜
-**執行目錄** `D:\Tooling\agent_orchestrator`（非 git repo，故 Codex 帶 `--skip-git-repo-check`）。
+**抓取時間** 2026-09-07 ｜ **機器** 本機（Windows 11）｜ **提示詞** 一律「回覆 OK」｜
+**執行目錄** 編排器安裝目錄（非 git repo，故 Codex 帶 `--skip-git-repo-check`）。
 標準輸入一律關閉（`< /dev/null`），stdout／stderr 分開存，exit code 存 `*.exit.txt`。
 Claude 兩份是在 Claude Code 對話內巢狀抓的，抓之前先
 `env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_PID -u CLAUDE_CODE_ENTRYPOINT`
