@@ -377,8 +377,9 @@ class Run:
         #    搬檔任務會整批失真——(a) `add --all` 把未暫存的刪除收進 index，`git diff` 從此看不到
         #    那些刪除，審查者只看到 N 個 new file、判成「複製不是搬移」；(b) 實作者若用 git mv 暫存好，
         #    index==工作樹，`git diff` 對那些檔一片空白。兩種都是同一個原因：比對基準錯了。
-        #    改成對 HEAD 比並開 -M（rename 偵測），暫存與否都呈現 R 列；驗證見 memory
-        #    multi-agent-orchestration 9/23 條（臨時 repo 兩情境實測：deleted=0/rename=0 → deleted=1/rename=1）。
+        #    改成對 HEAD 比並開 -M（rename 偵測），暫存與否都呈現 R 列；驗證＝2026-09-23 臨時 repo
+        #    兩情境實測（deleted=0/rename=0 → deleted=1/rename=1）。（原指 memory 9/23 條，該條 2026-10-05
+        #    整理時已刪，以本註解為準。）
         d = git(self.wt, "diff", "-M", "HEAD", "--", ".", ":(exclude)_refactor/*").stdout
         return d
 
