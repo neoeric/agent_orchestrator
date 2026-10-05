@@ -6,3 +6,6 @@ __pycache__/
 tasks/
 plans/
 runs/
+
+# C2: 推播設定（可能指到憑證檔），不進版控
+notify.json

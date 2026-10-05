@@ -43,7 +43,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
-from tools import iface_gate, inject_check, paths, runlock  # noqa: E402
+from tools import iface_gate, inject_check, notify, paths, runlock  # noqa: E402
 
 # 2026-10-05：verify 與陰性對照共用同一個逾時預設。原本陰性對照寫死 300、verify 是 1800，
 # 沒寫 timeout 的慢測試 verify 綠、陰性對照卻逾時，被誤判成「新斷言沒抓到違規」而退回實作者。
@@ -64,6 +64,21 @@ TASK_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,99}")
 # ---- C1（2026-10-05）：--status 總表
 STATUS_LIMIT = 15
 TERMINAL_PHASES = ("done", "escalate", "aborted")
+# ---- C2（2026-10-05）：只在需要人動手時推播。設定檔不存在＝整個功能關閉；測試把 RELAY_NOTIFY_CONFIG 指到不存在的路徑
+NOTIFY_LEDGER = HERE / "runs" / "notify_ledger.jsonl"
+
+
+def notify_config_path() -> Path:
+    """每次呼叫才讀環境變數（不在 import 時固定），測試與臨時換設定才有效。"""
+    return Path(os.environ.get("RELAY_NOTIFY_CONFIG") or HERE / "notify.json")
+
+
+class RateLimitStop(RuntimeError):
+    """撞牆（CLI 回 rate_limit）。獨立型別是為了讓 main() 以 kind="rate_limit" 中止並推播；仍是 RuntimeError，既有 except 照舊接得到。"""
+
+    def __init__(self, msg: str, cli: str = "") -> None:
+        super().__init__(msg)
+        self.cli = cli
 
 # 三個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
 PY = paths.resolve_python()
@@ -189,6 +204,7 @@ class State:
     max_rounds: int = 0       # 0＝舊 STATE（總表顯示 round/?）
     pid: int = 0              # 只供人看；判活一律看任務鎖（見 tools/runlock.py）
     abort_reason: str = ""
+    notified: dict = field(default_factory=dict)  # C2：這一棒發過的推播 {"kind","result","ts"}；沒發過是 {}
 
 
 def now() -> str:
@@ -416,9 +432,11 @@ def _read_state(path: Path) -> dict | None:
 
 
 class Run:
-    def __init__(self, task: dict, dry: bool, *, task_file: str = ""):
+    def __init__(self, task: dict, dry: bool, *, task_file: str = "", no_notify: bool = False):
         self.t = task
         self.dry = dry
+        self.no_notify = no_notify  # 人坐在終端機前跑時用（--no-notify）
+        self._notified = False      # 一棒最多一則：任何出口發過就不再發
         # 2026-10-05（C1）：dry-run 寫到 runs/<id>.dry/，不再覆蓋已跑過任務的真實紀錄（--status 略過 *.dry）
         self.dir = HERE / "runs" / (task["id"] + (".dry" if dry else ""))
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -444,18 +462,48 @@ class Run:
                        "ok": rec.ok, "failure_class": rec.failure_class, "seconds": rec.seconds, "usage": rec.usage})
         if rec.failure_class == "rate_limit":
             # P4 只偵測不換手：真正的 429 至今未直接觀察到，先讓它大聲停下來
-            raise RuntimeError(f"撞牆：{rec.cli} 回 rate_limit（{rec.reason}）。本版不自動換手，請人決定換誰。")
+            raise RateLimitStop(f"撞牆：{rec.cli} 回 rate_limit（{rec.reason}）。本版不自動換手，請人決定換誰。", cli=rec.cli)
 
     def log(self, msg: str, prefix: str = "RELAY") -> None:
         emit(prefix, msg, self.dir / "relay.log")
 
-    def abort(self, reason: str, notify: bool = True) -> None:
+    def abort(self, reason: str, notify: bool = True, kind: str = "aborted", **info) -> None:
         """例外中止也要落檔（2026-10-05，C1）：以前 RuntimeError 由 main() 接住後不寫 STATE，階段停在中止前
-        那格（例如 review），--status 看起來像還在跑。notify 參數留給棒 A3 接推播，本棒未使用。"""
+        那格（例如 review），--status 看起來像還在跑。C2：notify=True 時 STATE／CURRENT 都寫完才推播；
+        KeyboardInterrupt（人在場）呼叫端傳 notify=False。kind 讓撞牆走自己的文案。"""
         self.state.abort_reason = reason[:500]
         self.save("aborted")
         self.write_current(f"# CURRENT\n\n任務 {self.t['id']} 中止：{reason[:500]}；看 relay.log。\n")
         self.log(f"任務中止：{reason[:500]}")
+        if notify:
+            self.notify(kind, reason=reason, **info)
+
+    def notify(self, kind: str, **info) -> None:
+        """C2（2026-10-05）：在「需要人」的出口推播，且一棒最多一則。dry-run／--no-notify／已發過都直接略過。
+        推播的任何失敗（指令掛了、逾時、帳本鎖、設定壞）都只記 log，永遠不改變這一棒的結果與 exit code。"""
+        if self.dry or self.no_notify or self._notified:
+            return
+        self._notified = True
+        try:
+            started = _parse_ts(self.state.started)
+            minutes = int((datetime.now(timezone.utc) - started).total_seconds() // 60) if started else None
+            info = {"round": self.state.round, "max_rounds": self.state.max_rounds, "commit": self.state.commit,
+                    "branch": self.state.branch, "minutes": minutes, **info}
+            result = notify.notify(kind, self.t["id"], info, config_path=notify_config_path(), ledger_path=NOTIFY_LEDGER,
+                                   lock_path=LOCKS / "notify.lock")
+        except Exception as e:  # ponytail: 連 notify 自己的 bug 也吞掉；代價是推播可能靜默沒發，relay.log 會留這行
+            result = f"推播例外：{type(e).__name__}"
+        if result == "推播關閉":
+            return
+        self.log(result)
+        self.state.notified = {"kind": kind, "result": result, "ts": now()}
+        self.save()
+        if result.startswith(("推播未發", "推播指令失敗")):  # 人回來看 CURRENT.md 就知道為什麼沒收到
+            try:
+                with open(self.dir / "CURRENT.md", "a", encoding="utf-8") as f:
+                    f.write(f"\n{result}\n")
+            except OSError:
+                pass
 
     def note_interrupted_previous(self) -> None:
         """拿到任務鎖之後呼叫（2026-10-05，C3）：上一次的 STATE 停在非終態＝那個行程沒收尾就不在了
@@ -801,6 +849,7 @@ class Run:
             self.handoff("done", impl_report, verify_summary, review_text, paths, "")
             self.write_current(f"# CURRENT\n\n任務 {self.t['id']} 已收斂並 commit `{self.state.commit}` 於 `{self.state.branch}`。\n下一步是人：審 HANDOFF.md → 合併 → 部署。編排器到此為止。\n")
             self.log(f"收斂：commit {self.state.commit}（{len(paths)} 個檔）")
+            self.notify("ready_to_merge")
             return 0
         self.save("escalate")
         try:
@@ -815,6 +864,11 @@ class Run:
         self.handoff("escalate", impl_report, verify_summary, review_text, paths, blocker)
         self.write_current(f"# CURRENT\n\n任務 {self.t['id']} **未收斂**，已升給人。看 HANDOFF.md。\n")
         self.log("未收斂，升給人")
+        if self.state.verdict == "review_tool_failure":
+            fc = next((c.get("failure_class") for c in reversed(self.state.calls) if c.get("role") == "reviewer"), None)
+            self.notify("review_tool_failure", failure_class=fc)
+        else:
+            self.notify("escalate")
         return 2
 
 
@@ -928,6 +982,7 @@ def main(argv=None) -> int:
     ap.add_argument("--ledger", action="store_true", help="印出跨任務用量帳本總計")
     ap.add_argument("--status", action="store_true", help=f"所有棒的階段、輪次、耗時、是否等人（預設最近 {STATUS_LIMIT} 筆）")
     ap.add_argument("--all", action="store_true", help="配 --status：列出全部紀錄")
+    ap.add_argument("--no-notify", action="store_true", help="這一棒不推播（人坐在終端機前跑時用）")
     ap.add_argument("--queue", action="store_true", help="並行名額（RELAY_MAX_PARALLEL，預設 1）滿了就排隊等，不直接拒跑")
     a = ap.parse_args(argv)
     if a.ledger:
@@ -964,7 +1019,7 @@ def main(argv=None) -> int:
     if prod and Path(task["worktree"]).resolve() == Path(prod).resolve():
         print("worktree 不得等於生產目錄", file=sys.stderr)
         return 3
-    run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()))
+    run = Run(task, a.dry_run, task_file=str(Path(a.task).resolve()), no_notify=a.no_notify)
     # 2026-10-05（C3）：取鎖與跑棒分兩段——取鎖階段被擋時 runs/<id>/ 可能正被別的行程寫，不可寫 STATE；
     # 跑棒階段的任何例外都在鎖還握著時落檔（C1：中止要寫進 STATE，總表才不會說謊）。dry-run 不取任何鎖。
     try:
@@ -984,6 +1039,10 @@ def main(argv=None) -> int:
         except KeyboardInterrupt:
             run.abort("使用者中斷", notify=False)
             return 130
+        except RateLimitStop as e:  # 撞牆：獨立 kind，文案是「等額度或換 CLI」；exit code 仍 3
+            print("relay 中止：", e, file=sys.stderr)
+            run.abort(str(e), kind="rate_limit", cli=e.cli)
+            return 3
         except RuntimeError as e:  # relay 自己丟的中止：撞牆、worktree／prebuild 失敗、規格外改動、等 repo 鎖逾時…
             print("relay 中止：", e, file=sys.stderr)
             run.abort(str(e))

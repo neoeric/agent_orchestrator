@@ -1,5 +1,5 @@
 """_test_relay.py — relay 的純邏輯測試：難易度判準、結構化審查解析、簽章閘門、帳本、改動判定、
-陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）。不呼叫任何 AI CLI。
+陰性對照逾時、--status 總表（C1）、跨行程鎖與並行上限（C3）、推播（C2）。不呼叫任何 AI CLI。
 
 跑法：PYTHONUTF8=1 python _test_relay.py   （exit 0＝全過）
 """
@@ -593,14 +593,325 @@ def test_parallel() -> None:
           f"rc={rc} calls={calls}")
 
 
+FAKE_NOTIFIER = r'''import os, sys
+data = sys.stdin.buffer.read().decode("utf-8")
+mode = sys.argv[2] if len(sys.argv) > 2 else "ok"
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    f.write(os.environ.get("RELAY_NOTIFY_KIND", "") + "|" + data + "\n---\n")
+if mode == "fail":
+    sys.exit(7)
+if mode == "hang":
+    import time
+    time.sleep(30)
+'''
+
+
+def _write_cfg(d: Path, out: Path, mode: str = "ok", **extra) -> Path:
+    """寫一份假通道設定：cmd 是把 stdin 追加進 out 的小腳本。"""
+    script = d / "fake_notifier.py"
+    script.write_text(FAKE_NOTIFIER, encoding="utf-8")
+    cfg = d / "notify.json"
+    cfg.write_text(json.dumps({"cmd": [sys.executable, str(script), str(out), mode], **extra}), encoding="utf-8")
+    return cfg
+
+
+def _n_sent(out: Path) -> int:
+    return out.read_text(encoding="utf-8").count("\n---\n") if out.is_file() else 0
+
+
+def test_notify() -> None:
+    """C2（2026-10-05）：tools/notify.py 純函式＋假指令、Run.notify 接線。全程不連網、不呼叫真的通道。"""
+    from datetime import datetime, timedelta, timezone
+    from tools import notify
+
+    tz8 = timezone(timedelta(hours=8))
+    # 1. compose（5 項）
+    verbs = {"ready_to_merge": "待合併", "escalate": "未收斂", "review_tool_failure": "故障", "rate_limit": "撞牆", "aborted": "中止"}
+    info = {"round": 2, "max_rounds": 3, "commit": "abc1234", "branch": "feat/x", "failure_class": "login_expired",
+            "cli": "codex", "reason": "worktree add 失敗\r\n第二行", "minutes": 12}
+    for kind, verb in verbs.items():
+        lines = notify.compose(kind, "task-1", info).split("\n")
+        check(f"compose[{kind}]：第 1 行含 task id 與「{verb}」、第 2 行以「下一步：」開頭、無 \\r",
+              "task-1" in lines[0] and verb in lines[0] and lines[1].startswith("下一步：") and "\r" not in "\n".join(lines),
+              str(lines))
+
+    # 2. decide（6 項）
+    cfg = {**notify.DEFAULTS}
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=tz8)
+
+    def ent(minutes_ago: float, task="t", kind="escalate", sent=True, at=None):
+        return {"ts": (at or (now - timedelta(minutes=minutes_ago))).isoformat(), "task": task, "kind": kind, "sent": sent}
+
+    ok, why = notify.decide([], now, "t", "escalate", {**cfg, "kinds": ["aborted"]})
+    check("decide：kind 不在 kinds → kind_off", (ok, why) == (False, "kind_off"), why)
+    ok, why = notify.decide([ent(59)], now, "t", "escalate", cfg)
+    check("decide：同 task+kind 59 分前發過 → dedupe", (ok, why) == (False, "dedupe"), why)
+    ok, why = notify.decide([ent(61)], now, "t", "escalate", cfg)
+    check("decide：61 分前發過 → ok", (ok, why) == (True, "ok"), why)
+    ok, why = notify.decide([ent(m, task=f"o{m}") for m in (5, 10, 20, 30)], now, "t", "escalate", cfg)
+    check("decide：近一小時已 4 則 → hourly_cap", (ok, why) == (False, "hourly_cap"), why)
+    month = [ent(0, task=f"o{i}", at=datetime(2026, 10, 1 + i % 4, 1, 0, tzinfo=tz8)) for i in range(40)]
+    ok, why = notify.decide(month, now, "t", "escalate", cfg)
+    check("decide：本月已 40 則 → monthly_cap", (ok, why) == (False, "monthly_cap"), why)
+    prev = [ent(0, task=f"o{i}", at=datetime(2026, 9, 30, 23, 50, tzinfo=tz8) - timedelta(days=i % 5)) for i in range(40)]
+    prev.append(ent(0, task="o_oct", at=datetime(2026, 10, 1, 0, 10, tzinfo=tz8)))
+    ok, why = notify.decide(prev, now, "t", "escalate", {**cfg, "max_per_month": 2})
+    check("decide：上月 40 則不算本月（10-01T00:10+0800 算 10 月，本月只 1 則 → ok）", (ok, why) == (True, "ok"), why)
+    ok, why = notify.decide([ent(5, sent=False)] * 9, now, "t", "escalate", cfg)
+    check("decide：sent=false 的紀錄（被節流）不計入額度", (ok, why) == (True, "ok"), why)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        # 3. load_config（3 項＋預設值 1 項）
+        c, why = notify.load_config(d / "nope.json")
+        check("load_config：檔不存在 → (None, 'off')", (c, why) == (None, "off"), why)
+        (d / "bad.json").write_text("{not json", encoding="utf-8")
+        c, why = notify.load_config(d / "bad.json")
+        check("load_config：壞 JSON → None 且說明含「設定錯誤」", c is None and "設定錯誤" in why, why)
+        (d / "str.json").write_text(json.dumps({"cmd": "echo hi"}), encoding="utf-8")
+        c, why = notify.load_config(d / "str.json")
+        check("load_config：cmd 不是 list → 設定錯誤", c is None and "設定錯誤" in why, why)
+        (d / "ok.json").write_text(json.dumps({"cmd": ["x"], "max_per_hour": 2}), encoding="utf-8")
+        c, why = notify.load_config(d / "ok.json")
+        check("load_config：缺的欄位補預設（max_per_month=40、dedupe_minutes=60、五類全開）、有給的照用",
+              c is not None and c["max_per_hour"] == 2 and c["max_per_month"] == 40 and c["dedupe_minutes"] == 60
+              and set(c["kinds"]) == set(notify.KINDS), str(c))
+
+        # 4. send（3 項）
+        out = d / "o.txt"
+        cfg_path = _write_cfg(d, out)
+        c, _ = notify.load_config(cfg_path)
+        code, _err = notify.send(c, "第一行：中文\n第二行", {"RELAY_NOTIFY_KIND": "escalate"})
+        got = out.read_text(encoding="utf-8") if out.is_file() else ""
+        check("send：訊息走 stdin、種類走環境變數、中文不亂碼", code == 0 and got.startswith("escalate|第一行：中文\n第二行"), repr(got))
+        code, err = notify.send({**c, "cmd": [str(d / "no_such_exe_xyz")]}, "x", {})
+        check("send：指令不存在 → (None, …)、不 raise", code is None and err, f"{code} {err}")
+        code, _ = notify.send({**c, "cmd": c["cmd"][:2] + [str(out), "fail"]}, "x", {})
+        check("send：exit 7 的假指令 → 回 7", code == 7, str(code))
+        code, err = notify.send({**c, "cmd": c["cmd"][:2] + [str(out), "hang"], "timeout": 1}, "x", {})
+        check("send：逾時 → (None, …逾時)、不 raise", code is None and "逾時" in err, f"{code} {err}")
+
+        # 5. notify 整合（連發兩次）（1 項＋帳本內容 1 項）
+        out2, led, lock = d / "o2.txt", d / "led.jsonl", d / "n.lock"
+        cfg2 = _write_cfg(d, out2)
+        kw = dict(config_path=cfg2, ledger_path=led, lock_path=lock)
+        r1 = notify.notify("escalate", "t1", {"round": 2, "max_rounds": 2}, **kw)
+        r2 = notify.notify("escalate", "t1", {"round": 2, "max_rounds": 2}, **kw)
+        rows = [json.loads(x) for x in led.read_text(encoding="utf-8").splitlines()]
+        check("notify：同 task+kind 連發兩次 → 第二次 dedupe；帳本兩行、只有一行 sent=true、通道只被呼叫一次",
+              len(rows) == 2 and [r["sent"] for r in rows] == [True, False] and rows[1]["reason"] == "dedupe" and _n_sent(out2) == 1
+              and "dedupe" in r2, f"{r1} / {r2} / {rows}")
+        r3 = notify.notify("escalate", "t1", {}, config_path=d / "nope.json", ledger_path=led, lock_path=lock)
+        check("notify：設定檔不存在 → 回「推播關閉」、帳本不增行", r3 == "推播關閉" and len(led.read_text(encoding="utf-8").splitlines()) == 2, r3)
+
+        # 5b. 上限實測：最壞情況灌 20 個不同任務 → 全體每小時最多 4 次呼叫（1 項）
+        out3, led3 = d / "o3.txt", d / "led3.jsonl"
+        cfg3 = _write_cfg(d, out3)
+        for i in range(20):
+            notify.notify("aborted", f"burst-{i}", {"reason": "x"}, config_path=cfg3, ledger_path=led3, lock_path=lock)
+        rows = [json.loads(x) for x in led3.read_text(encoding="utf-8").splitlines()]
+        check("notify：20 個不同任務連續中止 → 通道只被呼叫 4 次（max_per_hour），其餘 hourly_cap",
+              _n_sent(out3) == 4 and sum(r["sent"] for r in rows) == 4 and rows[-1]["reason"] == "hourly_cap", str(_n_sent(out3)))
+        # 5c. 指令失敗也佔額度（sent=true、reason=send_failed）（1 項）
+        led4 = d / "led4.jsonl"
+        cfg4 = _write_cfg(d, d / "o4.txt", "fail")
+        r = notify.notify("aborted", "f1", {"reason": "x"}, config_path=cfg4, ledger_path=led4, lock_path=lock)
+        row = json.loads(led4.read_text(encoding="utf-8").splitlines()[0])
+        check("notify：指令失敗 → 帳本 sent=true、reason=send_failed、exit=7，回傳說明含 exit=7",
+              row["sent"] is True and row["reason"] == "send_failed" and row["exit"] == 7 and "exit=7" in r, f"{row} {r}")
+
+    # 6. Run.notify（3 項＋失敗不影響結果等）
+    tid = "_test_run_notify"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        led_bak, env_bak = relay.NOTIFY_LEDGER, os.environ.get("RELAY_NOTIFY_CONFIG")
+        relay.NOTIFY_LEDGER = d / "nl.jsonl"
+        try:
+            out = d / "o.txt"
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out))
+            task = {"id": tid, "worktree": ".", "repo": ".", "title": "t", "max_rounds": 3}
+            with contextlib.redirect_stdout(io.StringIO()):
+                r = relay.Run(task, dry=True)
+                r.notify("aborted", reason="x")
+                check("Run.notify：dry=True 不發", _n_sent(out) == 0 and not relay.NOTIFY_LEDGER.exists())
+                r = relay.Run(task, dry=False, no_notify=True)
+                r.notify("aborted", reason="x")
+                check("Run.notify：no_notify=True 不發", _n_sent(out) == 0 and not relay.NOTIFY_LEDGER.exists())
+                r = relay.Run(task, dry=False)
+                r.notify("aborted", reason="x")
+                r.notify("escalate")
+                r.abort("再中止一次")
+            st = json.loads((r.dir / "STATE.json").read_text(encoding="utf-8"))
+            check("Run.notify：同一個 Run 呼叫多次（含 abort）只發一次；STATE.notified 記 kind 與結果", _n_sent(out) == 1
+                  and st.get("notified", {}).get("kind") == "aborted" and "推播已發" in st["notified"]["result"], str(st.get("notified")))
+            # 被節流時 CURRENT.md 附一行（1 項）
+            with contextlib.redirect_stdout(io.StringIO()):
+                r2 = relay.Run(task, dry=False)
+                r2.write_current("# CURRENT\n\n任務中止。\n")
+                r2.notify("aborted", reason="x")
+            cur = (r2.dir / "CURRENT.md").read_text(encoding="utf-8")
+            check("被節流（同任務同類型 dedupe）→ CURRENT.md 末尾附「推播未發（dedupe）」", "推播未發（dedupe）" in cur, cur)
+            # 一棒的所有出口只發一則：Run.abort(kind=rate_limit) 帶 cli 進文案（1 項）
+            out_rl = d / "o_rl.txt"
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out_rl))
+            with contextlib.redirect_stdout(io.StringIO()):
+                r3 = relay.Run({**task, "id": tid + "_rl"}, dry=False)
+                r3.abort("撞牆：codex 回 rate_limit", kind="rate_limit", cli="codex")
+            body = out_rl.read_text(encoding="utf-8") if out_rl.is_file() else ""
+            check("abort(kind='rate_limit', cli=…)：推播第 1 行含 codex 與「撞牆」", body.startswith("rate_limit|【relay】") and "codex" in body.split("\n")[0]
+                  and "撞牆" in body.split("\n")[0], body)
+            rm_runs(tid + "_rl")
+
+            # 推播失敗／逾時／設定壞：Run.notify 不 raise、不改階段；main() 的 exit code 與 run.run() 的結果一致（3 項）
+            results = {}
+            for label, mode, extra in (("exit 7", "fail", {}), ("逾時", "hang", {"timeout": 1})):
+                os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, d / f"o_{mode}.txt", mode, **extra))
+                relay.NOTIFY_LEDGER = d / f"nl_{mode}.jsonl"
+                rr = relay.Run({**task, "id": tid + "_f"}, dry=False)
+                rr.save("escalate")
+                t0 = time.monotonic()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rr.notify("escalate")
+                results[label] = (rr.state.phase, round(time.monotonic() - t0, 1), rr.state.notified.get("result", ""))
+            check("推播指令 exit 7／逾時 → Run.notify 不 raise、階段仍是 escalate、逾時有被截斷（<10s）",
+                  all(v[0] == "escalate" for v in results.values()) and results["逾時"][1] < 10
+                  and "exit=7" in results["exit 7"][2] and "逾時" in results["逾時"][2], str(results))
+            rm_runs(tid + "_f")
+            (d / "badcfg.json").write_text("{oops", encoding="utf-8")
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(d / "badcfg.json")
+            rr = relay.Run({**task, "id": tid + "_f"}, dry=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rr.notify("escalate")
+            check("設定檔壞 → 視同關閉，記一行「推播設定錯誤」、不 raise", "推播設定錯誤" in rr.state.notified.get("result", ""), str(rr.state.notified))
+            rm_runs(tid + "_f")
+
+            # main()：exit code 不受推播影響（3 項）
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, d / "o_main.txt", "fail"))
+            relay.NOTIFY_LEDGER = d / "nl_main.jsonl"
+            (d / "spec.md").write_text("s", encoding="utf-8")
+            (d / "rev.md").write_text("r", encoding="utf-8")
+            mt = {"id": tid + "_m", "repo": str(d / "repo"), "base_branch": "main", "branch": "feat/x", "worktree": str(d / "wt"),
+                  "spec_file": str(d / "spec.md"), "verify": [], "review": {"policy": "always", "instructions_file": str(d / "rev.md")}}
+            (d / "task.json").write_text(json.dumps(mt), encoding="utf-8")
+            orig_run, orig_check, orig_nl = relay.Run.run, relay.paths.check_all, relay.NOTIFY_LEDGER
+            relay.paths.check_all = lambda: []
+
+            def run_ok(self):  # 假的「收斂」：只做會推播的那一步
+                self.notify("ready_to_merge")
+                return 0
+
+            def run_wall(self):
+                raise relay.RateLimitStop("撞牆：codex 回 rate_limit（測試）", cli="codex")
+
+            try:
+                rcs = {}
+                for name, fake in (("收斂", run_ok), ("撞牆", run_wall)):
+                    relay.Run.run = fake
+                    relay.NOTIFY_LEDGER = d / f"nl_main_{name}.jsonl"
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        rcs[name] = relay.main([str(d / "task.json")])
+                    rm_runs(tid + "_m")
+                check("main：推播指令 exit 7 時，收斂棒仍回 0、撞牆棒仍回 3", rcs == {"收斂": 0, "撞牆": 3}, str(rcs))
+                relay.Run.run = run_ok
+                n_before = _n_sent(d / "o_main.txt")
+                relay.NOTIFY_LEDGER = d / "nl_main_nn.jsonl"
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = relay.main([str(d / "task.json"), "--no-notify"])
+                check("main --no-notify：收斂棒回 0 且不呼叫通道", rc == 0 and _n_sent(d / "o_main.txt") == n_before and n_before >= 1,
+                      f"rc={rc} {n_before}")
+                rm_runs(tid + "_m")
+                # dry-run 不觸發推播（1 項）
+                before = (d / "o_main.txt").read_text(encoding="utf-8") if (d / "o_main.txt").is_file() else ""
+                relay.Run.run = orig_run
+                (d / "repo").mkdir(exist_ok=True)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = relay.main([str(d / "task.json"), "--dry-run"])
+                after = (d / "o_main.txt").read_text(encoding="utf-8") if (d / "o_main.txt").is_file() else ""
+                check("main --dry-run：不呼叫通道（通道輸出檔沒增加）", before == after, f"rc={rc}")
+            finally:
+                relay.Run.run, relay.paths.check_all, relay.NOTIFY_LEDGER = orig_run, orig_check, orig_nl
+                rm_runs(tid + "_m")
+        finally:
+            relay.NOTIFY_LEDGER = led_bak
+            if env_bak is None:
+                os.environ.pop("RELAY_NOTIFY_CONFIG", None)
+            else:
+                os.environ["RELAY_NOTIFY_CONFIG"] = env_bak
+            rm_runs(tid)
+
+
+def test_notify_telegram() -> None:
+    """C2（2026-10-05）：tools/notify_telegram.py。_post 整個換成假函式，不連網；憑證用明顯的假值。"""
+    from tools import notify_telegram as nt
+
+    FAKE_TOKEN = "123456:FAKE-TOKEN-FOR-TEST"
+    posts: list = []
+
+    def run(argv, env, text="哈囉", post=None):
+        posts.clear()
+        nt._post = post or (lambda url, data, timeout: (posts.append((url, data)) or (200, '{"ok":true}')))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nt.main(argv, environ=env, stdin=io.StringIO(text))
+        return rc, out.getvalue(), err.getvalue()
+
+    orig_post = nt._post
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+            d = Path(dd)
+            rc, o, e = run([], {})
+            check("telegram：缺兩個變數 → exit≠0，錯誤只寫變數名、沒有發出 HTTP", rc != 0 and "TELEGRAM_ALERT_TOKEN" in e
+                  and "TELEGRAM_ALERT_TO" in e and not posts, e)
+            rc, o, e = run([], {"TELEGRAM_ALERT_TOKEN": FAKE_TOKEN})
+            check("telegram：只缺聊天室 → exit≠0、只點名缺的那個、輸出不含 token",
+                  rc != 0 and "TELEGRAM_ALERT_TO" in e and FAKE_TOKEN not in o + e, e)
+            envf = d / "alert.env"
+            envf.write_text("\n".join(["# 註解", "", f"{nt.TOKEN_VAR}='{FAKE_TOKEN}'", f"{nt.CHAT_VAR} = -100999", "OTHER=x=y", ""]), encoding="utf-8-sig")
+            vals = nt.load_env_file(str(envf))
+            check("env-file 解析：略過註解與空行、去引號、等號兩側空白、值內含 = 保留",
+                  vals == {"TELEGRAM_ALERT_TOKEN": FAKE_TOKEN, "TELEGRAM_ALERT_TO": "-100999", "OTHER": "x=y"}, str(vals))
+            rc, o, e = run(["--env-file", str(envf)], {})
+            check("telegram：從 --env-file 讀憑證 → 成功印 NOTIFY telegram http=200、exit 0、POST 到 bot URL",
+                  rc == 0 and o.strip() == "NOTIFY telegram http=200" and len(posts) == 1 and f"/bot{FAKE_TOKEN}/" in posts[0][0], f"{rc} {o} {e}")
+            check("telegram：成功時 stdout／stderr 都不含 token 或 bot<token> URL", FAKE_TOKEN not in o + e)
+            rc, o, e = run(["--env-file", str(envf)], {"TELEGRAM_ALERT_TOKEN": "ENV-WINS-FAKE", "TELEGRAM_ALERT_TO": "42"})
+            check("telegram：環境變數優先於 --env-file", rc == 0 and "/botENV-WINS-FAKE/" in posts[0][0] and b"chat_id=42" in posts[0][1])
+            rc, o, e = run(["--env-file", str(d / "nope.env")], {})
+            check("telegram：--env-file 讀不到 → exit≠0 並說明", rc != 0 and "env-file" in e, e)
+            long_text = "字" * 5000
+            rc, o, e = run(["--env-file", str(envf)], {}, text=long_text)
+            import urllib.parse as up
+            sent = up.parse_qs(posts[0][1].decode("utf-8"))["text"][0]
+            check("telegram：超過 4096 字元 → 截斷到 ≤4096 並註明已截斷；未超過則原文送出",
+                  len(sent) <= 4096 and "已截斷" in sent and nt.truncate("短") == "短", str(len(sent)))
+            rc, o, e = run(["--env-file", str(envf)], {}, post=lambda u, dta, t: (400, f"bad request {u}"))
+            check("telegram：HTTP 非 200 → exit≠0、印 http=400、錯誤本文中的 token 已遮掉",
+                  rc != 0 and "http=400" in o and FAKE_TOKEN not in o + e and "***" in e, f"{o} {e}")
+
+            def boom(u, dta, t):
+                raise OSError(f"connect failed for {u}")
+
+            rc, o, e = run(["--env-file", str(envf)], {}, post=boom)
+            check("telegram：網路錯誤 → exit≠0、例外文字夾帶的 URL 已遮掉 token", rc != 0 and FAKE_TOKEN not in o + e and "OSError" in e, e)
+            rc, o, e = run(["--env-file", str(envf)], {}, text="  \n")
+            check("telegram：stdin 空白 → exit≠0、不發 HTTP", rc != 0 and not posts, e)
+    finally:
+        nt._post = orig_post
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
+    # C2：任何測試都不可真的推播——設定檔指到不存在的路徑、推播帳本寫暫存
+    os.environ["RELAY_NOTIFY_CONFIG"] = str(Path(tempfile.gettempdir()) / "relay_no_such_notify_config.json")
+    orig_nl = relay.NOTIFY_LEDGER
+    relay.NOTIFY_LEDGER = Path(tempfile.gettempdir()) / "relay_test_notify_ledger.jsonl"
     locks_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     relay.LOCKS = Path(locks_tmp.name) / "locks"
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
-                   test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel):
+                   test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
+                   test_notify, test_notify_telegram):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()
@@ -609,6 +920,7 @@ def main() -> int:
                 print(f"[FAIL] {fn.__name__} 例外：{exc!r}")
     finally:
         relay.LOCKS = orig_locks
+        relay.NOTIFY_LEDGER = orig_nl
         locks_tmp.cleanup()
     print(f"\n{PASSED} passed / {len(FAILED)} failed")
     for n in FAILED:

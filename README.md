@@ -149,6 +149,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 | `impl_r*` / `review_r*` / `verify_r*` | 每輪的 prompt、diff、審查指令、驗證輸出 |
 | `runs/usage_ledger.jsonl` | 跨任務帳本，每次呼叫一行（task／role／cli／usage／秒數／failure_class） |
 | `runs/.locks/` | 並行鎖檔（空檔，不必手動刪；見「並行」） |
+| `runs/notify_ledger.jsonl` | 推播帳本，每次嘗試一行（見「需要人時才推播」） |
 
 `--dry-run` 寫到 `runs/<id>.dry/`，不覆蓋真實紀錄。
 
@@ -188,6 +189,61 @@ foreach ($id in "task-a", "task-b") {
 python relay.py --status
 ```
 
+## 需要人時才推播（選用）
+
+一棒常跑十幾分鐘到一小時，人不會一直盯著終端機。relay 可以在「需要你動手」時推播一則；**沒有設定檔就整個關閉**（預設零行為改變）。relay 不內建任何通道，只呼叫你指定的外部指令、經 **stdin（UTF-8）** 交訊息，日後換通道只改設定檔。
+
+**只在五種出口各發一則，穩態不發**（一棒最多一則；`--dry-run`、`--no-notify`、Ctrl-C 都不發）：
+
+| kind | 時機 | 第 1 行（單獨成立）|
+|---|---|---|
+| `ready_to_merge` | 收斂、已 commit，等你審後合併 | `【relay】<任務> 待合併：第 N 輪收斂，commit <hash>` |
+| `escalate` | 輪數用完仍未收斂 | `【relay】<任務> 未收斂：N/M 輪用完` |
+| `review_tool_failure` | 審查工具故障，實作與驗證已完成、未 commit | `【relay】<任務> 審查工具故障（<類別>）：…` |
+| `rate_limit` | CLI 回 rate_limit 撞牆 | `【relay】<任務> 撞牆停下：<cli> 回 rate_limit` |
+| `aborted` | 其他例外中止 | `【relay】<任務> 中止：<原因前 60 字>` |
+
+訊息最多三行：第 1 行講哪個任務、發生什麼，第 2 行以「下一步：」講要你做什麼（手機通知常只看得到前兩行），第 3 行是耗時。只陳述事實，不評價結果。
+
+### 設定
+
+設定檔是 `notify.json`（放在 `relay.py` 旁，已列入 `.gitignore`），或用環境變數 `RELAY_NOTIFY_CONFIG` 指到別的路徑；**檔案不存在＝關閉**。格式錯誤時視同關閉，並在 `relay.log` 記一行「推播設定錯誤」。
+
+```json
+{
+  "cmd": ["python", "tools/notify_telegram.py", "--env-file", "/path/to/alert.env"],
+  "timeout": 30,
+  "max_per_hour": 4,
+  "max_per_month": 40,
+  "dedupe_minutes": 60,
+  "kinds": ["ready_to_merge", "escalate", "review_tool_failure", "rate_limit", "aborted"]
+}
+```
+
+只有 `cmd` 必填（非空字串陣列，不經 shell；`python` 請寫成你機器上的完整路徑）；其餘都是上面列的預設值。`cmd` 的 cwd 是你執行 `relay.py` 的目錄，相對路徑自己留意。
+
+🔴 **token 不可寫進 `cmd`**：命令列參數會被程序列表、shell 歷史、權限設定檔記錄。轉發腳本自己從環境變數或它自己的 env 檔讀。
+
+### Telegram 轉發腳本 `tools/notify_telegram.py`
+
+通用版，只用標準函式庫。沿用既有 bot 即可，憑證用這兩個變數名：
+
+```text
+TELEGRAM_ALERT_TOKEN=<bot token>
+TELEGRAM_ALERT_TO=<聊天室 id>
+```
+
+可以放在環境變數，或寫進 `--env-file` 指的檔案（`KEY=VALUE` 逐行，`#` 開頭為註解；環境變數優先）。缺變數時 exit 非 0 並只印變數名；訊息超過 Telegram 的 4096 字元會截斷並註明；成功印 `NOTIFY telegram http=200` 且 exit 0，網路錯誤或非 200 都 exit 非 0。任何輸出都不含 token。env 檔請放在版控目錄之外。
+
+### 節流與最壞情況
+
+帳本是 `runs/notify_ledger.jsonl`（一行一次嘗試：`sent` 表示「有呼叫外部指令」，不論成功與否，因為失敗的呼叫也可能吃額度）。判斷順序：kind 沒開 → 同任務同類型 `dedupe_minutes` 內發過 → 全體近 1 小時達 `max_per_hour` → 本月（UTC+8 曆月）達 `max_per_month`。被節流時帳本記 `sent=false` 與原因，`CURRENT.md` 末尾附一行「推播未發（原因）」。
+
+- 一棒最多 1 則。最壞情況是代理人在迴圈裡反覆重啟同一個壞任務：沒有節流時每小時可達上百則，有節流後同任務同類型每小時最多 1 則、**全體每小時最多 4 則、每月最多 40 則**。
+- 正常用量：一個月約 30 棒左右，五類全開約 30 則／月。
+- 推播指令失敗、逾時、帳本鎖逾時，都只記 `relay.log`、`STATE.json` 的 `notified` 欄位與帳本；**不會改變那一棒的結果與 exit code**。
+- 人坐在終端機前跑時加 `--no-notify`。
+
 ## judge.py 可以單獨用
 
 四支 CLI（claude／codex／gemini／agy）headless 回傳的白名單判定器，不依賴 relay：
@@ -212,13 +268,15 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 | `check_ps1_encoding.py` | .ps1 改動後 BOM 數不變、換行不混用、無控制字元、PSParser 0 錯 |
 | `../council.py` | 三方討論執行器（見下方「三方討論」） |
 | `agy_review.py` | agy 唯讀審查：diff 分塊餵進同一對話，用第 1 塊回傳的 conversation id 以 `--conversation <id>` 釘住（不用 `--continue`：它接「最近一個對話」，你同時在終端用 agy 或並行跑別棒會接錯；第 1 塊沒回 id 就 exit 1 停下）；命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒 |
+| `notify.py` | 推播判斷與送出（五種出口、dedupe／上限、外部指令經 stdin；見「需要人時才推播」） |
+| `notify_telegram.py` | 推播通道轉發腳本（Telegram，通用版；token 只讀環境變數或 `--env-file`） |
 | `runlock.py` | 跨行程檔案鎖（任務／worktree／並行名額／repo／帳本）；Windows `msvcrt`、POSIX `flock`，行程死掉 OS 自動釋放 |
 
 ## 測試
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行，93 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本，138 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
