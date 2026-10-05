@@ -22,7 +22,7 @@
 | Python 3.11+ | 跑 relay 與驗證指令 | — |
 | [Codex CLI](https://github.com/openai/codex) | 實作者角色 | 啟動時報錯停下 |
 | Antigravity CLI（`agy`） | 審查者角色 | 啟動時報錯停下（`review.policy` 全設 `never` 則不需要） |
-| git 2.5+ | `git worktree` 隔離 | — |
+| git 2.16+ | `git worktree` 隔離 | — |
 
 在 Windows 11 上開發與實測，其他平台沒測過。
 
@@ -68,7 +68,7 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `prebuild` | 開好 worktree 後、改碼前要跑的指令（裝依賴、建虛擬環境…）。⚠️ **新 worktree ≠ 你的工作目錄**：被 gitignore 的目錄、建置產物在新 worktree 都不存在，`verify[]` 依賴的產生物要在這裡補，否則第一輪會拿到假紅燈 |
 | `verify[]` | 每輪都要跑的驗證，`{name, cmd, timeout?, env?}`；全部 exit 0 才算過 |
 | `python` | 選填：verify／prebuild／陰性對照要用的 Python（例如專案 venv 的 `python.exe`）。沒設就用跑 relay 的那支直譯器；當 verify 需要的依賴只在專案 venv、而 relay 跑在別的 python 時設它（否則會拿到「缺依賴」的假紅燈）|
-| `negative_controls` | 選填：`[{target, old, new, verify_name?, expected_failure}]`。verify 綠**之後**，對每條把 `target`（worktree 內相對路徑）裡的 `old` 換成 `new`（一個真違規）、重跑 `verify_name`（省略=第一條 verify）、確認它**紅在 `expected_failure` 這個標記**、再逐位元組還原。任何一條「注入後沒紅在指定處」= 那條斷言是空的 ⇒ 整棒判 fail。把機器審從「斷言**在不在**」升級到「斷言**真的抓得到**」——就是人工重審在做的那件事 |
+| `negative_controls` | 選填：`[{target, old, new, verify_name?, expected_failure}]`。verify 綠**之後**，對每條把 `target`（worktree 內相對路徑）裡的 `old` 換成 `new`（一個真違規）、重跑 `verify_name`（省略=第一條 verify）、確認它**紅在 `expected_failure` 這個標記**、再逐位元組還原。任何一條「注入後沒紅在指定處」= 那條斷言是空的 ⇒ 整棒判 fail。把機器審從「斷言**在不在**」升級到「斷言**真的抓得到**」——就是人工重審在做的那件事。⚠️ **反向注入一律寫在這裡，不要寫成 `verify[]` 裡的自製腳本**：`verify[]` 各條互不知道結果，新測試本身就紅時自製注入會報「全抓到」（假陽性）；這裡保證注入前基線必綠、紅在指定 marker、逐位元組還原。每條對照會重跑基線（N 條＝2N 次 verify）。逾時沿用該條 verify 的 `timeout`（預設 1800 秒） |
 | `review.policy` | `always`（預設）／`never`／`auto`，判準見下節 |
 | `review.instructions_file` | 給審查者的逐條核對條件。⚠️ **每一條都必須「只看 diff 就能回答」**——審查者是唯讀、只拿到 diff，不給工具，要求它讀原始檔或附上測試實跑輸出，它結構上做不到，只會回「無法判定」。實跑證據由 `verify[]` 供給 |
 | `core_paths` | `auto` 判準用：碰到就一定送審 |
@@ -93,6 +93,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量
 2. prebuild
 3. Codex 依 spec_file 改碼（不 commit）
 4. verify[] 逐條跑，全部 exit 0 才算過
+4b. verify 全綠後跑 negative_controls：注入 → 必須紅在 marker → 還原
 5. 判準決定要不要送審 → agy 看 diff 唯讀審查，輸出結構化 verdict
 6. judge.py 核對每次 CLI 呼叫真的正常結束（不是「有輸出就當成功」）
 7. 過 → 以 allowed_paths 明列路徑 commit 到 branch；不過 → 把發現餵回步驟 3，最多 max_rounds 輪
@@ -172,7 +173,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，63 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本純邏輯，26 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本純邏輯，55 項
 ```
 
 `fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓），判定器契約測試靠它。
@@ -218,6 +219,8 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 - **agy 登入過期時 relay 只會停下升給人**（`review_tool_failure`，`stderr` 是 `Authentication required`），worktree 改動保留但不 commit。
   重登入後**不必重跑整棒**（會再燒一輪 Codex）：直接 `python tools\agy_review.py --instructions runs\<id>\review_r1_instr.txt --diff runs\<id>\review_r1_diff.txt --out ...`
   補審即可；HANDOFF 不會自動更新，結果要人記。
+- **commit 前判改動用內容比對**（2026-10-05）：只差行尾（CRLF↔LF）的檔視為沒改、不 commit、不觸發 `allowed_paths` 中止（autocrlf 下 `status` 會把它標成 ` M`）；
+  中文檔名以 `-z` 讀取。同一檔「內容也改了」照常 commit。
 
 ## 還沒做
 

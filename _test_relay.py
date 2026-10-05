@@ -205,11 +205,111 @@ def test_diff_for_review() -> None:
         finally:
             shutil.rmtree(relay.HERE / "runs" / "_test_diff_for_review", ignore_errors=True)
 
+def test_worktree_changes() -> None:
+    """B4（2026-10-05）：判改動改用內容比對＋`-z`，只差行尾的檔不算改動、中文檔名不亂碼。
+
+    病灶：autocrlf=true 下只差行尾的檔在 `status --porcelain` 標 ` M`，被當成規格外改動而中止 commit；
+    同函式解析帶引號路徑，中文檔名變成八進位跳脫字串。臨時 repo 的 autocrlf 一律在 local config 明設。
+    """
+    import inspect
+    import shutil
+    import subprocess
+
+    p = relay.parse_porcelain_z
+    check("parse_porcelain_z：一般檔", p(" M a.txt\0") == [(" M", "a.txt")], str(p(" M a.txt\0")))
+    check("parse_porcelain_z：含空白檔名原樣", p("?? my file.txt\0") == [("??", "my file.txt")])
+    check("parse_porcelain_z：中文檔名原樣", p(" M 中文.md\0") == [(" M", "中文.md")])
+    check("parse_porcelain_z：R 項跳過舊路徑", p("R  new.txt\0old.txt\0 M b.txt\0") == [("R ", "new.txt"), (" M", "b.txt")],
+          str(p("R  new.txt\0old.txt\0 M b.txt\0")))
+
+    def g(wt: str, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, encoding="utf-8")
+
+    def w(wt: str, name: str, data: bytes) -> None:
+        Path(wt, name).write_bytes(data)
+
+    with tempfile.TemporaryDirectory() as d:
+        wt = str(Path(d) / "wt")
+        Path(wt).mkdir()
+        g(wt, "init", "-q", "-b", "main"); g(wt, "config", "user.email", "t@t"); g(wt, "config", "user.name", "t")
+        g(wt, "config", "core.autocrlf", "false")
+        w(wt, "a.txt", b"x\ny\n"); w(wt, "crlf.txt", b"x\r\ny\r\n"); w(wt, "real.txt", b"old\n")
+        w(wt, "中文.md", b"old\n"); w(wt, "gone.txt", b"bye\n")
+        g(wt, "add", "-A"); g(wt, "commit", "-qm", "base")
+        g(wt, "config", "core.autocrlf", "true")
+        w(wt, "a.txt", b"x\r\ny\r\n"); w(wt, "crlf.txt", b"x\ny\n"); w(wt, "real.txt", b"new\n")
+        w(wt, "中文.md", b"new\n"); Path(wt, "gone.txt").unlink()
+        w(wt, "new.py", b"print(1)\n"); Path(wt, "views").mkdir(); w(wt, "views/x.txt", b"v\n")
+        want = {"real.txt", "中文.md", "gone.txt", "new.py"}
+        tid = "_test_worktree_changes"
+        try:
+            r = relay.Run({"id": tid, "worktree": wt, "repo": wt, "allowed_paths": sorted(want)}, dry=False)
+            got = set(r.worktree_changes())
+            check("worktree_changes：只差行尾（兩方向）與 views/ 不算改動", got == want, str(got))
+            try:
+                got2 = set(r.changed_paths())
+                check("changed_paths：allowed_paths 恰為真改動 → 不 raise", got2 == want, str(got2))
+            except RuntimeError as exc:
+                check("changed_paths：allowed_paths 恰為真改動 → 不 raise", False, str(exc))
+            r2 = relay.Run({"id": tid, "worktree": wt, "repo": wt, "allowed_paths": sorted(want - {"real.txt"})}, dry=False)
+            try:
+                r2.changed_paths()
+                check("changed_paths：少列 real.txt → raise", False, "沒 raise")
+            except RuntimeError as exc:
+                check("changed_paths：少列 real.txt → raise，訊息含 real.txt 不含 a.txt",
+                      "real.txt" in str(exc) and "a.txt" not in str(exc), str(exc))
+            sha = r.commit(sorted(want), "m")
+            shown = g(wt, "show", "--name-only", "--format=", "-z", "HEAD").stdout.split("\0")
+            check("commit：含 中文.md、不含 a.txt", sha != "" and "中文.md" in shown and "a.txt" not in shown, str(shown))
+        finally:
+            shutil.rmtree(relay.HERE / "runs" / tid, ignore_errors=True)
+    check("Run.run 不再自己解析 `status --porcelain`", "--porcelain" not in inspect.getsource(relay.Run.run))
+
+
+def test_negative_control_timeout() -> None:
+    """B5（2026-10-05）：陰性對照逾時預設要與 verify 一致（1800），否則慢測試被誤判『斷言抓不到違規』。"""
+    import shutil
+
+    orig_fn, orig_ledger = relay.inject_check.run_injection_check, relay.LEDGER
+    seen: dict = {}
+
+    def fake(*a, **kw):
+        seen.update(kw)
+
+    def mk(verify_extra: dict) -> "relay.Run":
+        t = {"id": "_test_nc_timeout", "worktree": ".", "repo": ".",
+             "verify": [{"name": "v1", "cmd": "echo hi", **verify_extra}],
+             "negative_controls": [{"target": "f.py", "old": "a", "new": "b", "expected_failure": "BAD"}]}
+        return relay.Run(t, dry=False)
+
+    try:
+        relay.inject_check.run_injection_check = fake
+        mk({}).negative_control(1)
+        check("陰性對照：verify 沒寫 timeout → 1800", seen.get("timeout") == 1800, str(seen.get("timeout")))
+        mk({"timeout": 77}).negative_control(1)
+        check("陰性對照：verify 寫 timeout=77 → 沿用 77", seen.get("timeout") == 77, str(seen.get("timeout")))
+
+        def boom(*a, **kw):
+            raise relay.inject_check.InjectionCheckError("baseline", "x")
+
+        relay.inject_check.run_injection_check = boom
+        ok, summary = mk({}).negative_control(1)
+        check("陰性對照：InjectionCheckError → (False, 含 [baseline])", ok is False and "[baseline]" in summary, summary)
+    finally:
+        relay.inject_check.run_injection_check = orig_fn
+        relay.LEDGER = orig_ledger
+        shutil.rmtree(relay.HERE / "runs" / "_test_nc_timeout", ignore_errors=True)
+
 
 def main() -> int:
-    for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review):
+    for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
+               test_worktree_changes, test_negative_control_timeout):
         print(f"--- {fn.__name__} ---")
-        fn()
+        try:
+            fn()
+        except Exception as exc:  # 改前（函式還不存在）要紅得有名字，不要整支崩潰
+            FAILED.append(f"{fn.__name__} 例外：{exc!r}")
+            print(f"[FAIL] {fn.__name__} 例外：{exc!r}")
     print(f"\n{PASSED} passed / {len(FAILED)} failed")
     for n in FAILED:
         print("  ✗", n)

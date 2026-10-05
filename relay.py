@@ -37,6 +37,11 @@ sys.path.insert(0, str(HERE))
 import judge  # noqa: E402
 from tools import iface_gate, inject_check, paths  # noqa: E402
 
+# 2026-10-05：verify 與陰性對照共用同一個逾時預設。原本陰性對照寫死 300、verify 是 1800，
+# 沒寫 timeout 的慢測試 verify 綠、陰性對照卻逾時，被誤判成「新斷言沒抓到違規」而退回實作者。
+VERIFY_TIMEOUT_DEFAULT = 1800
+# 2026-10-05：「新增但不算改動」的未追蹤路徑前綴預設值，changed_paths 與送審判準兩處共用。
+IGNORE_NEW_DEFAULT = ["_refactor/", "views/", "__pycache__"]
 LEDGER = HERE / "runs" / "usage_ledger.jsonl"  # P4：跨任務用量帳本（只記帳，不換手）
 
 # 三個 CLI 的位置：env → PATH → 已知安裝位置 → None（見 tools/paths.py）。可攜化 2026-09-08。
@@ -261,6 +266,26 @@ def git(repo: str, *args: str, timeout: int = 120) -> subprocess.CompletedProces
     return sh(["git", "-C", repo, *args], timeout=timeout)
 
 
+def parse_porcelain_z(out: str) -> list[tuple[str, str]]:
+    """`git status --porcelain -z` → [(XY, path)]。
+
+    為什麼用 -z：非 -z 會把中文檔名轉成八進位跳脫字串（2026-10-05 實測，路徑因此全壞），
+    -z 的路徑原樣輸出、以 NUL 分隔。X 為 R／C 時下一個 NUL 欄位是舊路徑，略過。"""
+    fields = out.split("\0")
+    res: list[tuple[str, str]] = []
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        i += 1
+        if len(f) < 4:  # 結尾空欄位或格式不符
+            continue
+        xy, path = f[:2], f[3:]
+        if xy[0] in "RC" or xy[1] in "RC":
+            i += 1  # 跳過舊路徑
+        res.append((xy, path))
+    return res
+
+
 class Run:
     def __init__(self, task: dict, dry: bool):
         self.t = task
@@ -359,7 +384,7 @@ class Run:
             cmd_py = cmd.replace("python ", f'"{self.t.get("python") or PY}" ', 1) if cmd.startswith("python ") else cmd
             t0 = time.monotonic()
             cp = stream(cmd_py, "VERIFY", _verify_line, cwd=self.wt, shell=True,
-                        env=item.get("env", {}), timeout=item.get("timeout", 1800), logf=self.dir / "relay.log")
+                        env=item.get("env", {}), timeout=item.get("timeout", VERIFY_TIMEOUT_DEFAULT), logf=self.dir / "relay.log")
             tail = "\n".join((cp.stdout + "\n" + cp.stderr).strip().splitlines()[-6:])
             ok = cp.returncode == 0
             all_ok &= ok
@@ -399,7 +424,7 @@ class Run:
                 # verify 是 shell 字串（跟 verify() 一樣用 shell 跑），inject_check 以 shell=True 執行
                 inject_check.run_injection_check(
                     str(Path(self.wt) / tgt), nc["old"], nc["new"], cmd_py, nc["expected_failure"],
-                    cwd=self.wt, timeout=vitem.get("timeout", 300), shell=True,
+                    cwd=self.wt, timeout=vitem.get("timeout", VERIFY_TIMEOUT_DEFAULT), shell=True,
                     report=lambda m: self.log(m, prefix="NEGCTL"),
                 )
                 lines.append(f"- {tgt}: 注入後正確紅在 {nc['expected_failure']!r} ✓")
@@ -455,15 +480,32 @@ class Run:
         return v.ok and pr["approved"], text, v.usage, v.ok
 
     # ---- 6. commit -----------------------------------------------------------
-    def changed_paths(self) -> list[str]:
+    def worktree_changes(self) -> list[str]:
+        """worktree 裡「真的有改」的路徑清單（commit 清單與送審檔數共用）。
+
+        2026-10-05：autocrlf 下只差行尾的檔在 `status` 標 ` M`，舊版因此當成規格外改動而中止 commit
+        （verify 全過、審查通過卻 commit 失敗）。改成對 ` M` 檔再比一次內容（`--ignore-cr-at-eol`），
+        純行尾差異略過；這種檔 `git add` 後 diff 為空，排除不會丟東西。
+        ponytail：每個 ` M` 檔一次子行程，O(n)，n 是改動檔數（實務 <20）；
+        升級路徑＝一次 `git diff --name-only -z --ignore-cr-at-eol` 取交集（舊版 git 行為未驗）。"""
         git(self.wt, "reset", "-q")  # 清掉 intent-to-add
-        st = git(self.wt, "status", "--porcelain").stdout.splitlines()
-        paths = []
-        for line in st:
-            code, path = line[:2], line[3:].strip().strip('"')
-            if code.strip() == "??" and any(path.startswith(x) for x in self.t.get("ignore_new", ["_refactor/", "views/", "__pycache__"])):
+        ignore_new = self.t.get("ignore_new", IGNORE_NEW_DEFAULT)
+        paths, eol_only = [], []
+        for xy, path in parse_porcelain_z(git(self.wt, "status", "--porcelain", "-z").stdout):
+            if xy == "??" and any(path.startswith(x) for x in ignore_new):
                 continue
+            if xy == " M":
+                # exit 0＝只差行尾；1＝真改動；其他（git 錯誤）一律保守當成改動，寧可多擋一次讓人看
+                if git(self.wt, "diff", "--quiet", "--ignore-cr-at-eol", "--", path).returncode == 0:
+                    eol_only.append(path)
+                    continue
             paths.append(path)
+        if eol_only:
+            self.log(f"略過只差行尾的檔（不 commit）：{eol_only}")
+        return paths
+
+    def changed_paths(self) -> list[str]:
+        paths = self.worktree_changes()
         allowed = self.t.get("allowed_paths")
         if allowed:
             bad = [p for p in paths if not any(p == a or p.startswith(a.rstrip("/") + "/") for a in allowed)]
@@ -561,8 +603,7 @@ class Run:
                 continue
             # P2：簽章閘門 + 難易度判準
             git(self.wt, "reset", "-q")
-            changed_now = [l[3:].strip() for l in git(self.wt, "status", "--porcelain").stdout.splitlines()
-                           if not (l[:2].strip() == "??" and any(l[3:].strip().startswith(x) for x in self.t.get("ignore_new", ["_refactor/", "views/", "__pycache__"])))]
+            changed_now = self.worktree_changes()
             gate = iface_gate.gate_worktree(self.wt, self.t["base_branch"])
             self.state.iface_gate = gate
             verify_failed_any = any(r["exit"] != 0 for r in self.state.verify)
