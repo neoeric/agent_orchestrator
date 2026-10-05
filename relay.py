@@ -542,6 +542,25 @@ def git(repo: str, *args: str, timeout: int = 120) -> subprocess.CompletedProces
     return sh(["git", "-C", repo, *args], timeout=timeout)
 
 
+def worktree_problem(wt: str, branch: str) -> str:
+    """沿用既有 worktree 前的檢查（2026-10-05）：回傳問題描述，沒問題回 ""。一般啟動（含 --dry-run）與 --resume 共用，訊息才不會互相矛盾。
+    為什麼：relay 紅線是「只 commit 到 task 自己的 branch」，路徑已存在就直接沿用的話，那個目錄若被人切到別的分支，
+    commit 會打到錯的分支；若它其實只是別個 repo 底下的普通資料夾，分支檢查會量到外層 repo。
+    只讀（rev-parse）；任何不符都只回報，relay 不代為 checkout／switch／reset（寧可多擋一次讓人看）。"""
+    top = git(wt, "rev-parse", "--show-toplevel")
+    try:  # samefile：git 回的是正斜線長路徑，任務檔可能寫短路徑／反斜線，字串比會誤判
+        same = top.returncode == 0 and os.path.samefile(top.stdout.strip(), wt)
+    except OSError:
+        same = False
+    if not same:
+        return (f"{wt} 不是 git worktree 的根目錄（{(top.stderr or top.stdout).strip()[-200:]}）；期望分支 {branch!r}；"
+                "relay 不代為 checkout，請人處理")
+    head = git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if head != branch:
+        return f"worktree {wt} 目前在 {head!r}，期望任務分支 {branch!r}；relay 不代為 checkout，請人處理"
+    return ""
+
+
 def parse_porcelain_z(out: str) -> list[tuple[str, str]]:
     """`git status --porcelain -z` → [(XY, path)]。
 
@@ -857,7 +876,13 @@ class Run:
             self.log(f"{'[dry] ' if self.dry else ''}resume：沿用 worktree {self.wt}（{t['branch']}），不重建、不跑 prebuild")
             return
         if self.dry:
-            self.log(f"[dry] worktree {self.wt} ← {t['base_branch']} 新分支 {t['branch']}")
+            if Path(self.wt).exists():  # 2026-10-05：dry-run 也驗，不符就停（exit 3），免得 dry 綠、真跑才擋
+                bad = worktree_problem(self.wt, t["branch"])
+                if bad:
+                    raise RuntimeError(bad)
+                self.log(f"[dry] worktree {self.wt} 已存在且在 {t['branch']}，會沿用")
+            else:
+                self.log(f"[dry] worktree {self.wt} ← {t['base_branch']} 新分支 {t['branch']}")
             return
         base = git(self.repo, "rev-parse", "--short", t["base_branch"]).stdout.strip()
         self.state.base_commit = base
@@ -875,7 +900,10 @@ class Run:
                 raise RuntimeError("worktree add 失敗：" + r.stderr[-400:])
             self.log(f"worktree 建立 {self.wt}（{t['branch']} ← {t['base_branch']}@{base}）")
         else:
-            self.log(f"worktree 已存在，沿用 {self.wt}")
+            bad = worktree_problem(self.wt, t["branch"])  # 2026-10-05：沿用前先驗分支與根目錄，不符就大聲停
+            if bad:
+                raise RuntimeError(bad)
+            self.log(f"worktree 已存在且在 {t['branch']}，沿用 {self.wt}")
         self.state.branch, self.state.worktree = t["branch"], self.wt
         for cmd in t.get("prebuild", []):
             self.log(f"prebuild: {cmd}")
@@ -1682,16 +1710,9 @@ def prepare_resume(task_id: str, cli_task: str | None, rounds_arg: int | None) -
         raise TaskError(f"STATE 記的分支 {state.branch} 與任務檔的 {task['branch']} 不同：換分支就是另一棒，請開新棒")
     if not Path(wt).is_dir():
         raise TaskError(f"worktree 不存在：{wt}。resume 不重建 worktree（重建＝從頭重跑）；要從頭請用 relay.py <task.json> 另開一棒")
-    top = git(wt, "rev-parse", "--show-toplevel")
-    try:  # samefile：git 回的是正斜線長路徑，任務檔可能寫短路徑／反斜線，字串比會誤判
-        same = top.returncode == 0 and os.path.samefile(top.stdout.strip(), wt)
-    except OSError:
-        same = False
-    if not same:  # 例如一般資料夾剛好在別的 repo 底下：分支檢查會量到外層 repo，必須先擋
-        raise TaskError(f"{wt} 不是 git worktree 的根目錄（{(top.stderr or top.stdout).strip()[-200:]}）；請人工確認")
-    head = git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-    if head != task["branch"]:
-        raise TaskError(f"worktree 目前在 {head!r}，不是任務分支 {task['branch']!r}；relay 不代為 checkout，請人工確認後再 resume")
+    bad = worktree_problem(wt, task["branch"])  # 2026-10-05：與一般啟動共用同一個檢查（根目錄＋分支）
+    if bad:
+        raise TaskError(bad)
     if state.commit and git(wt, "merge-base", "--is-ancestor", state.commit, "HEAD").returncode != 0:
         raise TaskError(f"分支 {task['branch']} 上找不到上次的 commit {state.commit}（被 reset／rebase 過？）；relay 不改寫歷史，請人工確認")
     np = rd / "human_notes.md"
@@ -1770,7 +1791,9 @@ def rank_candidates(states: list[dict]) -> list[dict]:
         v_total = len(ver) if ver else int(s.get("_verify_total") or 0)
         nc = [n for n in (s.get("negctl") or []) if isinstance(n, dict) and n.get("round") == rnd]
         verdict = s.get("verdict") or ""
-        if s.get("phase") == "aborted" or not verdict:
+        if s.get("phase") == "not_run":  # 2026-10-05：整組停止時沒啟動的候選（run_group 補的合成 STATE）
+            verdict = "not_run"
+        elif s.get("phase") == "aborted" or not verdict:
             verdict = "aborted" if s.get("phase") == "aborted" else "incomplete"
         ap = [d for d in (s.get("review_decisions") or []) if isinstance(d, dict) and d.get("round") == rnd and "approved" in d]
         m = CAND_ID_RE.search(s.get("task_id") or "")
@@ -1783,15 +1806,21 @@ def rank_candidates(states: list[dict]) -> list[dict]:
             "diff_lines": int((s.get("diff_stats") or {}).get("lines", 0)), "rounds": rnd,
             "seconds": round(sum(c.get("seconds") or 0 for c in (s.get("calls") or []) if isinstance(c, dict)), 1),
             "branch": s.get("branch") or "", "commit": s.get("commit") or ""})
-    rows.sort(key=lambda r: (r["verdict"] != "converged", r["verdict"] == "aborted", -r["verify_pass"], not r["negctl_ok"], REVIEW_RANK[r["review"]],
+    rows.sort(key=lambda r: (r["verdict"] != "converged", r["verdict"] == "not_run", r["verdict"] == "aborted", -r["verify_pass"], not r["negctl_ok"], REVIEW_RANK[r["review"]],
                              r["breaking"], r["unreported"], r["diff_lines"], r["rounds"], r["seconds"], r["cand"]))
     return rows
 
 
-def render_ranking(gid: str, rows: list[dict], tasks: dict[int, dict]) -> str:
-    """RANKING.md 內容。清理指令只是印給人的文字（relay 紅線：從不代執行 worktree remove／branch -D）。"""
+def render_ranking(gid: str, rows: list[dict], tasks: dict[int, dict], stopped: str = "") -> str:
+    """RANKING.md 內容。清理指令只是印給人的文字（relay 紅線：從不代執行 worktree remove／branch -D）。
+    stopped（2026-10-05）：整組提前停止的原因；有值時檔頭先講，未執行（not_run）的候選不列清理指令（它們沒有 worktree／分支）。"""
     first = rows[0]
-    L = [f"# {gid} best-of-{len(rows)} 排名", "",
+    L = [f"# {gid} best-of-{len(rows)} 排名", ""]
+    if stopped:
+        nr = [f"c{r['cand']}" for r in rows if r["verdict"] == "not_run"]
+        L += [f"> 🔴 **{stopped}**。未執行（not_run）：{'、'.join(nr) or '無'}。先檢查生產目錄，再決定要不要重跑；"
+              "下表只是已跑部分的排名，不要直接拿來合併。", ""]
+    L += [
          "機器已跑完每份候選的 verify＋閘門＋審查再排名；人只需要看第一名。排序：收斂 > verify 過的條數 > 陰性對照 > 審查 > "
          "介面破壞數 > 未申報數 > diff 行數 > 輪數 > 秒數 > 候選序。", "",
          "| 名次 | 候選 | 實作者 | verdict | verify | negctl | review | breaking | unreported | diff行 | 輪 | 秒 | 分支@commit |",
@@ -1809,6 +1838,8 @@ def render_ranking(gid: str, rows: list[dict], tasks: dict[int, dict]) -> str:
                  f"先讀 `runs/{gid}.c{first['cand']}/HANDOFF.md` 看卡點。")
     L += ["", "其餘候選的 worktree 與分支都保留。清理指令（relay **不**代執行，人確認不要了再自己跑）：", "", "```"]
     for r in rows[1:]:
+        if r["verdict"] == "not_run":
+            continue
         ct = tasks[r["cand"]]
         L += [f'git -C "{ct["repo"]}" worktree remove "{ct["worktree"]}"', f'git -C "{ct["repo"]}" branch -D "{ct["branch"]}"']
     L += ["```", "", f"第一名（c{first['cand']}）合併後，它的 worktree 與分支同理由人清理。", ""]
@@ -1833,6 +1864,8 @@ def run_group(task: dict, a) -> int:
     """best-of-N：依序跑每份候選（決策 D7：不平行，整個群組只佔 1 個並行名額），全跑完讀各自的 STATE 排名，
     寫 runs/<id>/RANKING.md 與 GROUP.json，推播一則。一份候選中止（RuntimeError／其他例外）只標那一份 aborted，
     繼續下一份。排名只讀 STATE、不動任何 worktree／branch；清理指令只印不執行。exit：第一名收斂 0，否則 2。
+    例外（2026-10-05）：任一候選丟 ProductionTouched（生產目錄被改）→ 該份 abort、**不再啟動後面的候選**（下一份會把已被改過的
+    生產目錄當新基準，前一份造成的改動從此偵測不到）；仍寫 RANKING／GROUP（未跑的記 not_run）、推播一則 escalate、exit 3（同單棒）。
     dry-run：每份候選各走自己的 dry，只印計畫，不取鎖、不寫 RANKING／GROUP。
     ponytail: 候選之間完全串列，N 份的牆鐘時間是 N 倍；升級路徑＝改成多個名額並行跑（需先實測並行的額度與本機狀態）。"""
     gid, dry = task["id"], bool(getattr(a, "dry_run", False))
@@ -1853,7 +1886,7 @@ def run_group(task: dict, a) -> int:
         return 3
     except KeyboardInterrupt:
         return 130
-    t0, skipped, tfiles = time.monotonic(), set(), {}
+    t0, skipped, tfiles, stopped, stopped_id, dry_bad = time.monotonic(), set(), {}, "", "", False
     with locks:
         if not dry:
             gdir.mkdir(parents=True, exist_ok=True)
@@ -1887,8 +1920,16 @@ def run_group(task: dict, a) -> int:
                     if not dry:
                         (gdir / "GROUP.json").write_text(json.dumps({"id": gid, "state": "interrupted"}), encoding="utf-8")
                     return 130
+                except ProductionTouched as e:  # 必須排在 RuntimeError 前面（它是子類）：整組停，不再啟動後面的候選
+                    emit("RELAY", f"候選 {ct['id']} 中止：{e}")
+                    if run:
+                        run.abort(str(e), notify=False)
+                    stopped, stopped_id = f"生產目錄變動，整組停止（{ct['id']} 實作期間生產目錄被改動）", ct["id"]
+                    emit("RELAY", f"🔴 {stopped}；後面的候選不啟動")
+                    break
                 except RuntimeError as e:  # 規格外改動、worktree／prebuild 失敗…：只中止這一份
                     emit("RELAY", f"候選 {ct['id']} 中止：{e}")
+                    dry_bad = dry_bad or dry  # dry-run 的中止＝計畫有問題（例如既有 worktree 分支不符），最後回 3
                     if run:
                         run.abort(str(e), notify=False)
                 except Exception as e:
@@ -1898,26 +1939,36 @@ def run_group(task: dict, a) -> int:
                     traceback.print_exc()
         if dry:
             emit("RELAY", "[dry] 群組只印計畫，不寫 RANKING.md")
-            return 0
+            return 3 if dry_bad else 0
         states = []
+        last_run = max((k for k, ct in tmap.items() if ct["id"] == stopped_id), default=len(tmap)) if stopped else len(tmap)
         for k, ct in tmap.items():
             s = None if ct["id"] in skipped else _read_state(HERE / "runs" / ct["id"] / "STATE.json")
+            if stopped and k > last_run:  # 整組停止之後的候選：沒跑過，不讀它舊的 STATE
+                s = {"task_id": ct["id"], "phase": "not_run", "abort_reason": stopped}
             s = {"task_id": ct["id"], "phase": "aborted", "abort_reason": "未執行"} if s is None else dict(s)
             s["task_id"] = ct["id"]
             s["implementer"] = s.get("implementer") or ct["implementer"]
             s["_verify_total"] = len(ct.get("verify", []))
             states.append(s)
         rows = rank_candidates(states)
-        (gdir / "RANKING.md").write_text(render_ranking(gid, rows, tmap), encoding="utf-8")
+        (gdir / "RANKING.md").write_text(render_ranking(gid, rows, tmap, stopped), encoding="utf-8")
         first, n = rows[0], len(rows)
         converged = first["verdict"] == "converged"
         info = {"minutes": int((time.monotonic() - t0) // 60), "group": {
             "n": n, "cand": first["cand"], "implementer": first["implementer"], "verdict": first["verdict"]}}
-        res = _notify_group(gid, "ready_to_merge" if converged else "escalate", info, a)
-        (gdir / "GROUP.json").write_text(json.dumps({"id": gid, "state": "done", "candidates": [c["id"] for c in cts],
-                                                    "ranking": rows, "first": first["cand"], "notified": res}, ensure_ascii=False, indent=1),
-                                         encoding="utf-8")
+        if stopped:
+            info["group"]["stopped"] = stopped
+        res = _notify_group(gid, "escalate" if (stopped or not converged) else "ready_to_merge", info, a)
+        gj = {"id": gid, "state": "stopped" if stopped else "done", "candidates": [c["id"] for c in cts],
+              "ranking": rows, "first": first["cand"], "notified": res}
+        if stopped:
+            gj["stopped"] = stopped
+            gj["not_run"] = [tmap[r["cand"]]["id"] for r in rows if r["verdict"] == "not_run"]
+        (gdir / "GROUP.json").write_text(json.dumps(gj, ensure_ascii=False, indent=1), encoding="utf-8")
         emit("RELAY", f"排名完成：第一名 c{first['cand']}（{first['implementer']}，{first['verdict']}）；讀 runs/{gid}/RANKING.md")
+        if stopped:
+            return 3
         return 0 if converged else 2
 
 

@@ -52,8 +52,13 @@ def compose(kind: str, task_id: str, info: dict) -> str:
     if i.get("group"):
         # 2026-10-05（C4）：best-of-N 群組只發這一則；第 1 行講第一名是誰、第 2 行叫人去讀排名表
         g = i["group"]
-        l1 = f"【relay】{task_id} best-of-{g.get('n', '?')} 完成：第一名 c{g.get('cand', '?')}（{g.get('implementer') or '?'}，{g.get('verdict') or '?'}）"
-        l2 = f"下一步：讀 runs/{task_id}/RANKING.md，只看第一名的 HANDOFF"
+        if g.get("stopped"):
+            # 2026-10-05：有候選動了生產目錄 → 整組停止（紅線），不是「完成」；第 1 行就要講清楚，不報第一名免得被誤當成可合併
+            l1 = f"【relay】{task_id} best-of-{g.get('n', '?')} 中止：生產目錄被改動、整組停止"
+            l2 = f"下一步：先檢查生產目錄，再讀 runs/{task_id}/RANKING.md（未執行的候選標 not_run）"
+        else:
+            l1 = f"【relay】{task_id} best-of-{g.get('n', '?')} 完成：第一名 c{g.get('cand', '?')}（{g.get('implementer') or '?'}，{g.get('verdict') or '?'}）"
+            l2 = f"下一步：讀 runs/{task_id}/RANKING.md，只看第一名的 HANDOFF"
     elif kind == "ready_to_merge":
         l1 = f"【relay】{task_id} 待合併：第 {i.get('round', '?')} 輪收斂，commit {i.get('commit') or '?'}"
         l2 = f"下一步：讀 runs/{task_id}/HANDOFF.md 後自行合併 {i.get('branch') or '該分支'}（relay 不合併）"

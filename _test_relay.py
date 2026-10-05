@@ -2065,6 +2065,184 @@ def test_candidates() -> None:
             rm_runs(gid)
 
 
+def test_redlines() -> None:
+    """2026-10-05 紅線補強：(a) best-of-N 任一候選 ProductionTouched → 整組停；(b) 沿用既有 worktree 前先驗分支與根目錄。
+    全程 ScriptedRun、不呼叫 AI CLI；帳本與鎖指暫存、推播設定指到不存在路徑（只有驗「只推一則」用假指令＋暫存設定）；
+    臨時 repo 的 autocrlf 在 local 明設。測試自己造 worktree 用 `worktree add -b <別的分支>`，不靠 checkout。"""
+    import shutil
+    import subprocess
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def call(argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = relay.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def init_repo(p: Path) -> None:
+        p.mkdir(parents=True)
+        g(p, "init", "-q", "-b", "main"); g(p, "config", "user.email", "t@t"); g(p, "config", "user.name", "t")
+        g(p, "config", "core.autocrlf", "false")
+        (p / "a.py").write_bytes(b"x = 0\n")
+        g(p, "add", "-A"); g(p, "commit", "-qm", "base")
+
+    def mk(d: Path, gid: str, group: bool, **extra) -> tuple[Path, Path, dict]:
+        repo = d / "repo"
+        init_repo(repo)
+        (d / "spec.md").write_text("把 x 改成 1", encoding="utf-8")
+        (d / "review.md").write_text("1. x 有改", encoding="utf-8")
+        task = {"id": gid, "title": "紅線補強", "repo": str(repo), "base_branch": "main", "branch": "feat/rl",
+                "worktree": str(d / "wt"), "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
+                "review": {"policy": "always", "instructions_file": str(d / "review.md")},
+                "allowed_paths": ["a.py"], "max_rounds": 2, **extra}
+        if group:
+            task["candidates"] = [{"implementer": "codex"}, {"implementer": "claude", "model": "sonnet"}]
+        tf = d / "task.json"
+        tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+        return repo, tf, task
+
+    def rm_runs(gid: str) -> None:
+        for p in (relay.HERE / "runs").glob(gid + "*"):
+            shutil.rmtree(p, ignore_errors=True)
+
+    gid = "ztest-rl-grp"
+    sid = "ztest-rl-one"
+    orig_ledger, orig_nl = relay.LEDGER, relay.NOTIFY_LEDGER
+    orig_run, orig_check, orig_env = relay.Run, relay.paths.check_all, os.environ.get("RELAY_NOTIFY_CONFIG")
+    scripts: dict[str, dict] = {}
+
+    def factory(task, dry, **kw):
+        if dry:
+            return orig_run(task, dry, **kw)
+        return ScriptedRun(task, scripts[task["id"]], **kw)
+
+    ok_script = lambda: {"impl": [{"write": {"a.py": "x = 1\n"}}], "verify": [True], "review": [(True, "總判定：可合併")]}  # noqa: E731
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        relay.LEDGER = d / "ledger.jsonl"
+        relay.paths.check_all = lambda **kw: []
+        try:
+            # ---- (a1) c1 動了生產目錄 → c2 不啟動、RANKING 有 not_run、exit 3、只推一則 -------------------------
+            out_f = d / "pushed.txt"
+            os.environ["RELAY_NOTIFY_CONFIG"] = str(_write_cfg(d, out_f))
+            relay.NOTIFY_LEDGER = d / "notify_ledger_a1.jsonl"
+            prod = d / "A1" / "prod"
+            init_repo(prod)
+            repo, tf, task = mk(d / "A1", gid, True, production_dir=str(prod))
+            c2 = ok_script()
+            scripts.update({gid + ".c1": {"impl": [{"write": {"a.py": "x = 1\n"}, "write_abs": {str(prod / "evil.txt"): "x"}}],
+                                          "verify": [True], "review": [(True, "總判定：可合併")]}, gid + ".c2": c2})
+            relay.Run = factory
+            try:
+                rc, out, err = call([str(tf)])
+            finally:
+                relay.Run = orig_run
+            rk = relay.HERE / "runs" / gid / "RANKING.md"
+            rtxt = rk.read_text(encoding="utf-8") if rk.is_file() else ""
+            sent = out_f.read_text(encoding="utf-8") if out_f.is_file() else ""
+            gj = relay.HERE / "runs" / gid / "GROUP.json"
+            gtxt = gj.read_text(encoding="utf-8") if gj.is_file() else ""
+            ntf = [json.loads(ln) for ln in relay.NOTIFY_LEDGER.read_text(encoding="utf-8").splitlines()] if relay.NOTIFY_LEDGER.is_file() else []
+            check("(a1) 群組 c1 丟 ProductionTouched → exit 3", rc == 3, f"rc={rc} {err.strip()[-200:]}")
+            check("(a1) c2 的實作沒有被呼叫（腳本沒被消耗）、沒有 c2 的 STATE／worktree",
+                  len(c2["impl"]) == 1 and not (relay.HERE / "runs" / (gid + ".c2") / "STATE.json").exists()
+                  and not (d / "A1" / "wt-c2").exists(), str(c2))
+            check("(a1) RANKING.md：c2 為 not_run、寫明「生產目錄變動，整組停止」、c1 為 aborted",
+                  "| 2 | c2 | claude | not_run |" in rtxt and "生產目錄變動，整組停止" in rtxt and "| 1 | c1 | codex | aborted |" in rtxt, rtxt[:700])
+            check("(a1) GROUP.json 記 stopped 原因與 not_run 的候選", "生產目錄變動，整組停止" in gtxt and gid + ".c2" in gtxt.split("not_run")[-1], gtxt[:300])
+            check("(a1) 推播假指令只呼叫 1 次、kind=escalate、第 1 行講生產目錄被改動、整組停止",
+                  _n_sent(out_f) == 1 and "生產目錄" in sent.splitlines()[0] and "整組停止" in sent.splitlines()[0]
+                  and [(e["task"], e["kind"]) for e in ntf] == [(gid, "escalate")], repr(sent[:300]) + str(ntf))
+            rm_runs(gid)
+
+            # ---- (a2) 對照：c1 規格外改動中止（生產目錄沒動）→ c2 照跑，既有行為不變 -----------------------------
+            prod2 = d / "A2" / "prod"
+            init_repo(prod2)
+            repo, tf, task = mk(d / "A2", gid, True, production_dir=str(prod2))
+            c2 = ok_script()
+            scripts.update({gid + ".c1": {"impl": [{"write": {"a.py": "x = 1\n", "other.py": "y = 1\n"}}], "verify": [True],
+                                          "review": [(True, "總判定：可合併")]}, gid + ".c2": c2})
+            relay.Run = factory
+            try:
+                rc, out, err = call([str(tf), "--no-notify"])
+            finally:
+                relay.Run = orig_run
+            rtxt = (relay.HERE / "runs" / gid / "RANKING.md").read_text(encoding="utf-8")
+            check("(a2) 規格外改動中止 c1 → c2 照跑（實作被呼叫）、c2 第一名、exit 0、RANKING 無 not_run",
+                  rc == 0 and len(c2["impl"]) == 0 and "| 1 | c2 |" in rtxt and "not_run" not in rtxt, f"rc={rc} {rtxt[:400]}")
+            rm_runs(gid)
+
+            # ---- (b) 沿用既有 worktree 前驗分支／根目錄 ------------------------------------------------------
+            def one(sub: str) -> tuple[Path, Path, dict, Path]:
+                repo, tf, task = mk(d / sub, sid, False)
+                return repo, tf, task, Path(task["worktree"])
+
+            def heads(*ps: Path) -> list[str]:
+                return [g(p, "rev-parse", "HEAD").stdout.strip() + "|" + g(p, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() for p in ps]
+
+            # b1：既有 worktree 在別的分支
+            repo, tf, task, wt = one("B1")
+            g(repo, "worktree", "add", "-q", "-b", "feat/other", str(wt), "main")
+            before = heads(wt, repo)
+            r = ScriptedRun(task, {})
+            msg = ""
+            try:
+                r.prepare()
+            except RuntimeError as e:
+                msg = str(e)
+            check("(b1) 既有 worktree 在別的分支 → prepare() raise RuntimeError，訊息含期望／實際分支與路徑、relay 不代為 checkout",
+                  "feat/rl" in msg and "feat/other" in msg and str(wt) in msg and "relay 不代為 checkout" in msg and "請人處理" in msg, msg)
+            check("(b1) worktree 與主 repo 的 HEAD、分支前後完全沒被改動", heads(wt, repo) == before and before[0].endswith("|feat/other"), str(before))
+            # b3：同一份 --dry-run → exit 3，且一樣沒動
+            rc, out, err = call([str(tf), "--dry-run"])
+            check("(b3) --dry-run 遇分支不符 → exit 3、訊息含兩個分支名、HEAD 未動",
+                  rc == 3 and "feat/other" in err and "feat/rl" in err and heads(wt, repo) == before, f"rc={rc} {err.strip()[-250:]}")
+            rm_runs(sid)
+
+            # b2：既有 worktree 在正確分支 → 照常沿用
+            repo, tf, task, wt = one("B2")
+            g(repo, "worktree", "add", "-q", "-b", "feat/rl", str(wt), "main")
+            before = heads(wt, repo)
+            r = ScriptedRun(task, {})
+            err2 = ""
+            try:
+                r.prepare()
+            except RuntimeError as e:
+                err2 = str(e)
+            check("(b2) 既有 worktree 在正確分支 → prepare() 照常沿用（不 raise、HEAD 不變、state.worktree 設好）",
+                  not err2 and heads(wt, repo) == before and r.state.worktree == str(wt) and r.state.branch == "feat/rl", err2)
+            rc, out, err = call([str(tf), "--dry-run"])
+            check("(b2) 正確分支的 --dry-run → exit 0", rc == 0, f"rc={rc} {err.strip()[-200:]}")
+            rm_runs(sid)
+
+            # b4：路徑存在但不是 git worktree 根（受測 repo 的子目錄）
+            repo, tf, task, wt = one("B4")
+            sub = repo / "subdir"
+            sub.mkdir()
+            task["worktree"] = str(sub)
+            before = heads(repo)
+            r = ScriptedRun(task, {})
+            msg = ""
+            try:
+                r.prepare()
+            except RuntimeError as e:
+                msg = str(e)
+            check("(b4) worktree 路徑是 repo 的子目錄（不是 worktree 根）→ raise，訊息含路徑與「根目錄」，repo 未動",
+                  str(sub) in msg and "根目錄" in msg and heads(repo) == before, msg)
+            rm_runs(sid)
+        finally:
+            relay.Run, relay.paths.check_all = orig_run, orig_check
+            relay.LEDGER, relay.NOTIFY_LEDGER = orig_ledger, orig_nl
+            if orig_env is None:
+                os.environ["RELAY_NOTIFY_CONFIG"] = str(Path(tempfile.gettempdir()) / "relay_no_such_notify_config.json")
+            else:
+                os.environ["RELAY_NOTIFY_CONFIG"] = orig_env
+            rm_runs(gid)
+            rm_runs(sid)
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -2077,7 +2255,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff, test_candidates):
+                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff, test_candidates, test_redlines):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()

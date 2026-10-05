@@ -383,7 +383,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，68 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手／同任務多候選，289 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手／同任務多候選／紅線補強（整組停止、沿用 worktree 驗分支），301 項
 PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
 ```
 
@@ -487,5 +487,7 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
 
 - **審查者換手**：agy 撞牆只會停下推播，不會換別家審。
 - **best-of-N 只支援明確宣告**：不會因第一輪失敗自動分叉；候選依序跑、不平行。
+- 🔴 **best-of-N 任一候選動了生產目錄 → 整組停止**（2026-10-05）：該候選照常 `aborted`，**後面的候選不啟動**（否則下一份會把已被改過的生產目錄當新基準，前一份的改動從此偵測不到）。仍寫 `RANKING.md`（未跑的標 `not_run`）與 `GROUP.json`，推播一則 `escalate`，群組 exit **3**；其他中止原因（規格外改動、審查工具故障…）仍是只中止該份、繼續下一份。
+- 🔴 **沿用既有 worktree 前先驗分支**（2026-10-05）：`worktree` 路徑已存在時，relay 會確認它是 git worktree 的根目錄、且目前分支就是任務的 `branch`（`--dry-run` 與 `--resume` 同一套檢查）；不符就停（exit 3），訊息列出期望／實際分支與路徑。relay **不會**代為 checkout／switch／reset，請人自己處理後再跑。
 - **批次啟動器**：並行要自己開兩個行程（每個行程自己守 RELAY_MAX_PARALLEL 名額），沒有一個指令跑一批的 launcher。
 - 帳本只用於換手冷卻（預設關），沒有做額度預算。
