@@ -2,7 +2,8 @@
 
 為什麼要分塊：Windows 命令列上限約 32K 字元，`agy -p "<整包 diff>"` 超過就 exit 126 根本沒啟動；
 而本機實測 agy 無頭模式**不讀 stdin**（redirect 與 pipe 都回 NO_STDIN），又不能給檔案路徑
-（headless 讀檔工具會被軟拒 → status=SUCCESS 但 response 空）。`--continue` 能沿用上一輪對話，
+（headless 讀檔工具會被軟拒 → status=SUCCESS 但 response 空）。`--conversation <id>` 能沿用同一個對話
+（id 取自第 1 塊的回傳；`--continue` 只當備援，理由見 run_agy），
 所以：第 1..N 輪各送一塊 diff 要它「只回 OK」，第 N+1 輪送審查指令。
 
 每一輪都用 -p 明說「不要使用任何工具」，避免它想跑指令被無頭模式自動拒絕後回空 response。

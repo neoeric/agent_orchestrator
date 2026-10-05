@@ -166,7 +166,7 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 | `extract_defs.py` | 把頂層定義抽成新模組並在原檔原名 re-export；連緊貼的註解一起搬，保 CRLF |
 | `iface_gate.py` | 簽章閘門：公開介面的 breaking／additive 判定 |
 | `check_ps1_encoding.py` | .ps1 改動後 BOM 數不變、換行不混用、無控制字元、PSParser 0 錯 |
-| `agy_review.py` | agy 唯讀審查：diff 分塊用 `--continue` 餵進同一對話（命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒） |
+| `agy_review.py` | agy 唯讀審查：diff 分塊餵進同一對話，用第 1 塊回傳的 conversation id 以 `--conversation <id>` 釘住（不用 `--continue`：它接「最近一個對話」，你同時在終端用 agy 會接錯）；命令列有 32K 上限、agy 不讀 stdin、給路徑會被軟拒 |
 
 ## 測試
 
@@ -211,6 +211,13 @@ Claude `input＋cache_creation＋cache_read`；Codex `input_tokens`（已含 cac
   這條踩過三次（AST 閘門漏判／審查者依指令沒讀外部原始檔＝只驗 diff 內部自洽／規格要求了它做不到的事），
   共同結論是：**閘門檢查不到的地方，不能假設審查者會自己補。**
 - 在 Claude Code 對話裡巢狀呼叫 `claude -p`，要先 unset `CLAUDECODE` 等環境變數（`fixtures/README.md` 有完整清單）。
+- **`tools/agy_review.py` 的分塊實務上限是 3 塊**（2026-09-16 踩到）：同一份 19 條指令，diff 48KB 切 3 塊審得好好的，
+  diff 62KB 切 4 塊時 agy 最後那一問只回了塊確認「OK 3」（`len=4`），沒有審查內容、白跑 329 秒；
+  同一份 diff 改 `--chunk 34000` 切 2 塊就正常（51 秒、19/19）。⇒ diff 超過 ~55KB 先調大 `--chunk`（單塊 ≤ ~35KB 實測可）
+  或把測試／文件的 diff 拆開送審，別讓塊數到 4。`review:` 那行 `len` 個位數＝這個症狀，不是審查通過。
+- **agy 登入過期時 relay 只會停下升給人**（`review_tool_failure`，`stderr` 是 `Authentication required`），worktree 改動保留但不 commit。
+  重登入後**不必重跑整棒**（會再燒一輪 Codex）：直接 `python tools\agy_review.py --instructions runs\<id>\review_r1_instr.txt --diff runs\<id>\review_r1_diff.txt --out ...`
+  補審即可；HANDOFF 不會自動更新，結果要人記。
 
 ## 還沒做
 
