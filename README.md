@@ -103,7 +103,7 @@ PYTHONUTF8=1 python relay.py --ledger                        # 看累計用量�
 `PYTHONUTF8=1` 在 Windows 是必要的，否則輸出非 ASCII 會直接 cp950 crash。
 
 離開碼：`0`＝收斂並已 commit；`2`＝不收斂或被擋（含**撞牆**：可用的實作者都回 `rate_limit`、或審查者回 `rate_limit`），已寫 HANDOFF 給人；
-`3`＝參數／環境錯、被鎖擋下拒跑、或例外中止（STATE 記 `aborted`）；`130`＝Ctrl-C。
+命令列參數錯（argparse）也回 `2`；`3`＝任務檔內容錯、環境自檢失敗、被鎖擋下拒跑、或例外中止（STATE 記 `aborted`）；`130`＝Ctrl-C。
 
 `--status` 的「等人？」欄：`跑中`／`排隊中`（任務鎖有人持有）、`待合併 <commit>`、
 `要人看（未收斂／審查工具故障／撞牆／中止：原因）`、`中斷？（行程已不在）`（STATE 停在中途但任務鎖沒人持有＝
@@ -414,7 +414,7 @@ PYTHONUTF8=1 python council.py --dir C:/work/council-topic --round 2 --who agy  
 | `--brief` / `--extra FILE...` / `--no-prev` | 簡報檔名（相對 `--dir`）／依序附在最後的附加材料／不附上一輪 |
 | `--claude-model` / `--codex-model` / `--timeout` | 模型與逾時（預設 codex 1800／claude 1200／agy 900 秒） |
 | `--raw-dir` / `--dump` | 原始輸出目錄（預設 `<dir>/_raw`）／只寫出各方 prompt、不呼叫任何 CLI |
-| `--no-safe-mode` | claude 預設帶 `--safe-mode`（不載入使用者 hooks／plugins／CLAUDE.md）；它若影響輸出格式時的退路 |
+| `--no-safe-mode` | claude 預設帶 `--safe-mode`（依 `claude --help`：停用 CLAUDE.md／skills／plugins／hooks／MCP 等自訂；⚠️ 實抓樣本的 init 事件仍列出已安裝 plugins 清單，是否真的未載入沒有驗證）；它若影響輸出格式時的退路 |
 
 **怎麼保證唯讀**：codex 用 `-s read-only`；claude 只開 `Read,Glob,Grep` 三個工具（無 repo 權時 `--tools ""` 完全無工具），
 並用空的 MCP 設定；agy 無工具。prompt 一律走 stdin（命令列有 32K 上限）。agy 的 prompt 超過 28,000 字元才分塊，

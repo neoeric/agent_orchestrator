@@ -22,7 +22,7 @@
   PYTHONUTF8=1 python relay.py --status [--all]             # 所有棒的階段、輪次、耗時、是否等人
   PYTHONUTF8=1 python relay.py --resume <task_id> [--rounds N]  # 人工意見回灌：讀 runs/<id>/human_notes.md 接續下一輪
 離開碼：0＝收斂並已 commit；2＝不收斂／被擋（含撞牆：可用的實作者都回 rate_limit、或審查者回 rate_limit），
-已寫 HANDOFF 給人；3＝參數／環境錯、被鎖擋下拒跑、或例外中止（STATE 記 aborted）；130＝Ctrl-C。
+已寫 HANDOFF 給人，命令列參數錯（argparse）也回 2；3＝任務檔內容錯、環境自檢失敗、被鎖擋下拒跑、或例外中止（STATE 記 aborted）；130＝Ctrl-C。
 """
 from __future__ import annotations
 

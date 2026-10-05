@@ -56,7 +56,7 @@ def run_agy(prompt: str, conv: str | None, timeout: int) -> tuple[dict | None, s
 def _split_long_line(line: str, size: int) -> list[str]:
     """單行就超過一塊上限時硬切成多段（UTF-8 位元組計、字元邊界），每段尾加續行標記。
 
-    2026-09-14 實際踩到：gateway_reviewer 的 engine.py 第 76 行 RULE_VERSION 註解是一條 ~75KB 的
+    2026-09-14 實際踩到：某受測專案一個模組裡的版本註解是一條 ~75KB 的
     單行，改版本號＝diff 帶新舊兩份 ⇒ 一塊 150KB ⇒ CreateProcess WinError 206「檔名或副檔名太長」，
     review 工具崩潰、relay 把崩潰當成 changes_requested 送實作者空轉一輪。不截斷（審查者要看到全文），只切。"""
     if len(line.encode("utf-8")) <= size:
