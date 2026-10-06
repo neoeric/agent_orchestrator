@@ -68,6 +68,15 @@ def test_s0() -> None:
     e = paths.claude_env({"CLAUDECODE": "1", "CLAUDE_CODE_OAUTH_TOKEN": "x", "PATH": "p"})
     check("S0 claude_env：清掉 CLAUDECODE", "CLAUDECODE" not in e)
     check("S0 claude_env：保留認證變數與 PATH", e.get("CLAUDE_CODE_OAUTH_TOKEN") == "x" and e.get("PATH") == "p", str(e))
+    # 2026-10-06：Claude Code 對話注入的 6 個 session 變數也要清；使用者設定變數要留
+    e2 = paths.claude_env({"CLAUDE_AGENT_SDK_VERSION": "1", "CLAUDE_CODE_EMIT_STARTUP_TIMING": "1",
+                           "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "true", "CLAUDE_CODE_ENABLE_TASKS": "0",
+                           "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT": "markdown", "CLAUDE_CODE_SESSION_ATTENDED": "1",
+                           "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_EFFORT_LEVEL": "low"})
+    check("S0 claude_env：清掉 session 注入的 6 個 CLAUDE_CODE_* 變數",
+          set(e2) == {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_EFFORT_LEVEL"}, str(sorted(e2)))
+    check("S0 claude_env：使用者設定變數（USE_BEDROCK／EFFORT_LEVEL）保留",
+          e2.get("CLAUDE_CODE_USE_BEDROCK") == "1" and e2.get("CLAUDE_CODE_EFFORT_LEVEL") == "low", str(sorted(e2)))
 
     orig_which = paths.shutil.which
     try:

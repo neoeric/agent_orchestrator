@@ -59,7 +59,12 @@ def resolve_agy() -> str | None:
 # 刻意列舉而不是整批刪 CLAUDE_*:那一批可能含認證變數(例如 OAuth token),刪了子行程就登不進去。
 CLAUDE_NESTED_ENV = ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
                      "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID",
-                     "CLAUDE_CODE_ENTRYPOINT")
+                     "CLAUDE_CODE_ENTRYPOINT",
+                     # 2026-10-06 本機實查（VS Code 擴充內的 Claude Code 2.1.290 對話）：子行程另會繼承這 6 個 session 注入變數，
+                     # 都不是使用者設定用的。使用者設定變數（CLAUDE_CODE_USE_BEDROCK／CLAUDE_CODE_EFFORT_LEVEL／*_OAUTH_TOKEN…）不在此列、要保留，
+                     # 所以只能明確列舉、不可用前綴整批刪
+                     "CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_EMIT_STARTUP_TIMING", "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+                     "CLAUDE_CODE_ENABLE_TASKS", "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "CLAUDE_CODE_SESSION_ATTENDED",)
 
 _THIN_SHELLS = (".cmd", ".bat", ".ps1")
 

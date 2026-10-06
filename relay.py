@@ -1594,6 +1594,9 @@ def _check_candidates(task: dict) -> None:
             raise TaskError(f"候選 id {ct['id']!r} 不合法（task id 太長？候選要加 .cK 後綴）")
         if prod and Path(ct["worktree"]).resolve() == Path(prod).resolve():
             raise TaskError(f"候選 {ct['id']} 的 worktree 不得等於生產目錄")
+        m = ct.get("implementer_models")  # 2026-10-06：候選用 claude 也要指定模型（candidates[k].model 或 task 的 implementer_models.claude）
+        if ct["implementer"] == "claude" and not (isinstance(m, dict) and m.get("claude")):
+            raise TaskError(f"候選 {ct['id']} 用 claude 但沒指定模型：寫 candidates[k].model 或 task 的 implementer_models.claude（成本要事前可見）")
 
 
 def load_task(path: Path) -> dict:
@@ -1637,6 +1640,10 @@ def load_task(path: Path) -> dict:
         if v is not None and not (isinstance(v, dict) and all(k in allowed and isinstance(x, str) and x.strip()
                                                                for k, x in v.items())):
             raise TaskError(f"{key} 必須是 {{實作者: 非空字串}}，實作者只能是 {' / '.join(allowed)}（給的是 {v!r}）")
+    # 2026-10-06：implementer 含 claude 卻沒指定模型 → 會跟著使用者的 Claude Code 設定走（可能是最貴的那個），成本要事前可見
+    if "candidates" not in task and "claude" in order and not (task.get("implementer_models") or {}).get("claude"):
+        raise TaskError('implementer 含 claude 時必須在 implementer_models 指定模型（例如 {"claude": "sonnet"}）；'
+                        "不指定會用你的 Claude Code 預設模型，成本不可見")
     eff = (task.get("implementer_effort") or {}).get("claude")
     if eff is not None and eff not in CLAUDE_EFFORTS:
         raise TaskError(f"implementer_effort.claude 不合法：{eff!r}（只能是 {' / '.join(CLAUDE_EFFORTS)}）")

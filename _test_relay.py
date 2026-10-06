@@ -1411,6 +1411,14 @@ def test_impl_command() -> None:
                                                          {"implementer_models": {"gemini": "x"}}, {"implementer_models": {"claude": ""}},
                                                          {"implementer": ["codex", "gemini"]})]
             check("implementer_models／implementer_effort 寫錯、implementer 清單含未知值 → main 回 3", rcs == [3] * 5, str(rcs))
+            # 2026-10-06：implementer 含 claude 卻沒指定模型 → 3（成本要事前可見）；指定了 → dry-run 0
+            bad = [main_rc(x, "--dry-run") for x in ({"implementer": "claude"}, {"implementer": ["codex", "claude"]},
+                                                      {"implementer": ["codex", "claude"], "implementer_models": {"codex": "m"}})]
+            check("implementer 含 claude 但沒指定 implementer_models.claude → main 回 3 且訊息點名 implementer_models",
+                  [b[0] for b in bad] == [3] * 3 and all("implementer_models" in b[1] for b in bad), str(bad))
+            rc_ok, e_ok = main_rc({"implementer": ["codex", "claude"], "implementer_models": {"claude": "sonnet"}}, "--dry-run")
+            check("implementer 含 claude 且指定了模型 → dry-run 回 0", rc_ok == 0, f"rc={rc_ok} {e_ok!r}")
+            rm_runs("_test_impl_task")
 
             # 8. check_all 需求計算（2 項）
             calls: list = []
@@ -1423,7 +1431,7 @@ def test_impl_command() -> None:
             relay.paths.check_all = rec_check
             try:
                 rc1, _ = main_rc({"review": {**base["review"], "policy": "never"}})
-                rc2, _ = main_rc({"implementer": "claude"})
+                rc2, _ = main_rc({"implementer": "claude", "implementer_models": {"claude": "sonnet"}})
             finally:
                 relay.paths.check_all = orig_check
             check("check_all 需求：policy=never＋codex → 不要求 agy、不要求 claude", rc1 == 3 and calls[:1] == [
@@ -1476,7 +1484,7 @@ def test_impl_command() -> None:
             def guard_task(tid: str) -> Path:
                 t = {**base, "id": tid, "title": "c4a 守門", "repo": str(d / tid), "worktree": str(d / tid), "branch": "feat/c4a",
                      "production_dir": str(prod), "verify": [{"name": "v", "cmd": "echo ok"}], "allowed_paths": ["a.py"],
-                     "max_rounds": 1, "implementer": "claude"}
+                     "max_rounds": 1, "implementer": "claude", "implementer_models": {"claude": "sonnet"}}
                 tf = d / f"{tid}.json"
                 tf.write_text(json.dumps(t, ensure_ascii=False), encoding="utf-8")
                 return tf
@@ -1543,7 +1551,7 @@ def test_handoff() -> None:
         task = {"id": tid, "title": "c5 測試", "repo": str(wt), "base_branch": "main", "branch": "feat/c5", "worktree": str(wt),
                 "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
                 "review": {"policy": "always", "instructions_file": str(d / "review.md")},
-                "allowed_paths": ["a.py"], "max_rounds": 2, "implementer": ["codex", "claude"], **extra}
+                "allowed_paths": ["a.py"], "max_rounds": 2, "implementer": ["codex", "claude"], "implementer_models": {"claude": "sonnet"}, **extra}
         tf = d / "task.json"
         tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
         return wt, tf
@@ -1616,7 +1624,7 @@ def test_handoff() -> None:
         rcs = []
         for extra in ({"implementer": []}, {"implementer": ["codex", "codex"]}, {"implementer": ["codex", 1]}, {"implementer": "Codex"},
                       {"handoff_cooldown_minutes": -1}, {"handoff_cooldown_minutes": True}, {"handoff_cooldown_minutes": "5"},
-                      {"handoff_cooldown_minutes": 1.5}, {"implementer": ["codex", "claude"], "handoff_cooldown_minutes": 30}):
+                      {"handoff_cooldown_minutes": 1.5}, {"implementer": ["codex", "claude"], "implementer_models": {"claude": "sonnet"}, "handoff_cooldown_minutes": 30}):
             (hp / "t.json").write_text(json.dumps({**base, **extra}), encoding="utf-8")
             rcs.append(call([str(hp / "t.json"), "--dry-run"])[:2])
         rm_runs("_test_handoff_cfg")
@@ -1952,6 +1960,7 @@ def test_candidates() -> None:
                                 ("候選 implementer 非法", {"candidates": [{"implementer": "codex"}, {"implementer": "gemini"}]}),
                                 ("候選 implementer 給清單（候選不換手）", {"candidates": [{"implementer": ["codex", "claude"]}, {"implementer": "codex"}]}),
                                 ("候選 effort 配 codex", {"candidates": [{"implementer": "codex", "effort": "high"}, {"implementer": "claude"}]}),
+                                ("候選 claude 沒指定模型", {"candidates": [{"implementer": "codex"}, {"implementer": "claude"}]}),
                                 ("候選 worktree 等於 production_dir", {"production_dir": str(d / "V" / "wt-c2")})):
                 tf2 = d / "V" / "t2.json"
                 tf2.write_text(json.dumps({**task, **over}, ensure_ascii=False), encoding="utf-8")

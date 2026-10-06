@@ -68,7 +68,7 @@ relay 啟動時自檢，缺哪支當場大聲說，不會跑到一半才炸。
 | `production_dir` | 選填但**強烈建議填**：`worktree` 等於它就直接拒跑，防手滑改到生產目錄。它是 git repo 時另有**生產目錄守門**：每次實作者呼叫前後各取一次快照（`git --no-optional-locks status --porcelain -z -uall`＋列出檔的大小／mtime＋HEAD），不同就整棒中止（exit 3、`aborted`）。被 `.gitignore` 的檔看不到；別的 session／服務在那段時間寫了生產目錄也會中止（誤報＝重跑一棒） |
 | `spec_file` | 給實作者的完全指定規格（相對路徑以編排器目錄為基準） |
 | `implementer` | `codex`（預設）或 `claude`；**可寫清單**如 `["codex", "claude"]`＝撞牆（judge 判 `rate_limit`）時依序換手（見「換手」）。其他值（含寫錯、空清單、重複）啟動時就 exit 3，不再靜默用 Codex；清單裡每一支都會在開跑前自檢。prompt 一律經 stdin 送，沒有命令列長度上限 |
-| `implementer_models` | 選填 `{"claude": "sonnet", "codex": "<model>"}`：各實作者用的模型；沒給＝該 CLI 自己的預設（claude 跟著你的 Claude Code 設定走，可能是最貴的那個） |
+| `implementer_models` | `{"claude": "sonnet", "codex": "<model>"}`：各實作者用的模型。**implementer 含 claude（單一、清單或候選）時 claude 必填**，沒給 exit 3（2026-10-06：不然會跟著你的 Claude Code 設定走、可能是最貴的那個，成本不可見）；codex 選填，沒給＝CLI 自己的預設 |
 | `implementer_effort` | 選填 `{"claude": "high"}`（`low`／`medium`／`high`／`xhigh`／`max`）；只接受 claude，寫錯 exit 3 |
 | `candidates` | 選填，best-of-N：`[{"implementer":"codex"},{"implementer":"claude","model":"sonnet"}]`，2～3 項（寫死上限），每項 `implementer` 必填且是單一字串、`model`／`effort`（effort 只給 claude）選填；有此欄時 task 的 `implementer` 被忽略；見「同任務多候選」 |
 | `handoff_cooldown_minutes` | 選填，整數分鐘，預設 `0`（關）。>0 時，帳本裡這段時間內回過 `rate_limit` 的實作者，本棒一開始就先略過（只是建議：清單裡全都在窗內就照用第一個）；見「換手」 |
@@ -383,8 +383,8 @@ python judge.py gemini out.txt --exit 144 --json                        # 機器
 
 ```text
 PYTHONUTF8=1 python _test_judge.py    # 判定器契約測試，68 項
-PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手／同任務多候選／紅線補強（整組停止、沿用 worktree 驗分支）／dry-run 不碰 worktree 與 codex 舊報告檔，305 項
-PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），51 項
+PYTHONUTF8=1 python _test_relay.py    # 判準／解析／閘門／帳本／狀態總表／鎖與並行／推播與 Telegram 轉發腳本／人工意見回灌／實作者可插拔與生產目錄守門／撞牆換手／同任務多候選／紅線補強（整組停止、沿用 worktree 驗分支）／dry-run 不碰 worktree 與 codex 舊報告檔／claude 必指定模型，308 項
+PYTHONUTF8=1 python _test_council.py  # council 純邏輯＋Claude CLI 解析（假 CLI，不燒額度），53 項
 ```
 
 `fixtures/` 是三支 CLI 的**真實回傳樣本**（2026-09-07 抓；實作者用的 claude stream-json 與 codex stdin 兩種形狀 2026-10-05 補抓），判定器契約測試靠它。
