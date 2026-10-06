@@ -2243,6 +2243,97 @@ def test_redlines() -> None:
             rm_runs(sid)
 
 
+FAKE_CODEX_FAIL = r'''import sys
+sys.stdin.buffer.read()
+sys.exit(1)
+'''
+
+
+def test_dryrun_and_stale_report() -> None:
+    """2026-10-06：① codex 在寫 -o 前失敗不得讀到上次的 last_message 檔；② --dry-run 不碰既有 worktree
+    （不 git reset、不列改動、不跑簽章閘門）。不呼叫任何 AI CLI：① 用假 codex（python 腳本，讀完 stdin 直接 exit 1）。"""
+    import re
+    import subprocess
+
+    def g(wt, *a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True, encoding="utf-8")
+
+    def init_repo(p: Path) -> None:
+        p.mkdir(parents=True)
+        g(p, "init", "-q", "-b", "main"); g(p, "config", "user.email", "t@t"); g(p, "config", "user.name", "t")
+        g(p, "config", "core.autocrlf", "false")
+        (p / "a.py").write_bytes(b"x = 0\n")
+        g(p, "add", "-A"); g(p, "commit", "-qm", "base")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
+        d = Path(dd)
+        (d / "spec.md").write_text("規格第一行\n", encoding="utf-8")
+        (d / "rev.md").write_text("1. x 有改", encoding="utf-8")
+
+        # ---- ① codex 失敗且沒寫 -o：上次留下的 last_message 檔不得當成本次報告（2 項）----------------
+        wt = d / "wt"
+        wt.mkdir()
+        (d / "fake_codex_fail.py").write_text(FAKE_CODEX_FAIL, encoding="utf-8")
+        tid = "_test_stale_last_message"
+        orig_build, orig_ledger = relay.build_impl_command, relay.LEDGER
+        relay.LEDGER = d / "ledger.jsonl"
+
+        def fake_build(cli, wt_, out_last, model=None, effort=None):
+            real = orig_build(cli, wt_, out_last, model=model, effort=effort)
+            return relay.ImplCmd([sys.executable, str(d / "fake_codex_fail.py")], real.prefix, real.line_fn, real.drop_env)
+
+        try:
+            relay.build_impl_command = fake_build
+            r = relay.Run({"id": tid, "worktree": str(wt), "repo": str(wt), "spec_file": str(d / "spec.md"),
+                           "implementer": "codex"}, dry=False)
+            stale = r.dir / "impl_r1_last_message.md"
+            stale.write_text("舊報告：上一次跑留下的", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok, report, usage = r.implement(1, "")
+            check("implement(codex)：舊的 last_message 檔不得當成本次報告", not ok and report == "",
+                  f"ok={ok} report={report!r}")
+            exit_f = r.dir / "impl_r1.exit.txt"
+            exit_txt = exit_f.read_text(encoding="utf-8") if exit_f.is_file() else ""
+            last_call = r.state.calls[-1] if r.state.calls else {}
+            check("implement(codex)：呼叫前已刪舊檔、exit 檔記 exit=1、判定器記 failure_class",
+                  not stale.exists() and exit_txt == "exit=1" and bool(last_call.get("failure_class")),
+                  f"stale={stale.exists()} exit={exit_txt!r} call={last_call}")
+        finally:
+            relay.build_impl_command, relay.LEDGER = orig_build, orig_ledger
+            rm_runs(tid)
+
+        # ---- ② --dry-run 沿用既有 worktree：暫存區與狀態前後一致（2 項）--------------------------------
+        repo, wt2 = d / "repo", d / "wt2"
+        init_repo(repo)
+        g(repo, "worktree", "add", "-q", "-b", "feat/dry", str(wt2), "main")
+        (wt2 / "a.py").write_bytes(b"x = 1\n")
+        g(wt2, "add", "a.py")                      # 人暫存好的改動
+        (wt2 / "new.txt").write_bytes(b"n\n")      # 未追蹤檔
+        tid2 = "_test_dry_keeps_index"
+        task = {"id": tid2, "title": "dry 不碰 worktree", "repo": str(repo), "base_branch": "main", "branch": "feat/dry",
+                "worktree": str(wt2), "spec_file": str(d / "spec.md"), "verify": [{"name": "v", "cmd": "echo ok"}],
+                "review": {"policy": "always", "instructions_file": str(d / "rev.md")}, "allowed_paths": ["a.py"], "max_rounds": 1}
+        tf = d / "task.json"
+        tf.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+
+        def snap(p: Path) -> tuple[str, str, str]:
+            return (g(p, "rev-parse", "HEAD").stdout, g(p, "status", "--porcelain", "-z").stdout,
+                    g(p, "diff", "--cached", "--name-only").stdout)
+
+        before_wt, before_repo = snap(wt2), snap(repo)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = relay.main([str(tf), "--dry-run"])
+        text = re.sub(r"\x1b\[[0-9;]*m", "", out.getvalue())
+        check("dry-run：既有 worktree 的暫存區不被 reset（a.py 仍在 index）",
+              rc == 0 and before_wt[2].strip() == "a.py" and snap(wt2) == before_wt,
+              f"rc={rc} cached_after={snap(wt2)[2]!r} err={err.getvalue()[-300:]}")
+        check("dry-run：印出「[dry] 不碰 worktree」、主 repo HEAD／status 不變、不建 runs/<id>/",
+              "[dry] 不碰 worktree" in text and snap(repo) == before_repo and not (relay.HERE / "runs" / tid2).exists(),
+              text[-600:])
+        rm_runs(tid2)
+
+
 def main() -> int:
     # C3（2026-10-05）：測試產生的鎖一律落在暫存目錄，不碰 runs/.locks/
     orig_locks = relay.LOCKS
@@ -2255,7 +2346,7 @@ def main() -> int:
     try:
         for fn in (test_decide_review, test_parse_review, test_iface_gate, test_ledger_totals, test_diff_for_review,
                    test_worktree_changes, test_negative_control_timeout, test_status, test_runlock, test_parallel,
-                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff, test_candidates, test_redlines):
+                   test_notify, test_notify_telegram, test_resume, test_impl_command, test_handoff, test_candidates, test_redlines, test_dryrun_and_stale_report):
             print(f"--- {fn.__name__} ---")
             try:
                 fn()

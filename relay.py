@@ -1038,6 +1038,7 @@ class Run:
             self.log(f"[dry] 實作者 {IMPL_NAMES[cli]}：{' '.join(ic.argv[1:])}（round {rnd}，prompt {len(prompt)} 字走 stdin）")
             return True, "(dry)", None
         self.log(f"實作者 {IMPL_NAMES[cli]} 開跑（round {rnd}）…")
+        out_last.unlink(missing_ok=True)  # 2026-10-06：同任務重跑沿用 runs/<id>/，codex 在寫 -o 前失敗會把上次的報告檔當成這次的
         t0 = time.monotonic()
         cp = stream(ic.argv, ic.prefix, ic.line_fn, cwd=self.wt, timeout=self.t.get("impl_timeout", 1500),
                     logf=self.dir / "relay.log", input_text=prompt, drop_env=ic.drop_env)
@@ -1347,9 +1348,14 @@ class Run:
             if review_base:
                 diff = self.diff_for_review(review_base)
             # P2：簽章閘門 + 難易度判準
-            git(self.wt, "reset", "-q")
-            changed_now = self.worktree_changes()
-            gate = iface_gate.gate_worktree(self.wt, self.t["base_branch"])
+            if self.dry:
+                # 2026-10-06：dry-run 不碰 worktree——以前這三步照跑，沿用既有 worktree 時會把人暫存好的 index reset 掉
+                changed_now, gate = [], {}
+                self.log("[dry] 不碰 worktree：跳過 git reset／改動清單／簽章閘門（下面的審查判準以空輸入計算，真跑才準）")
+            else:
+                git(self.wt, "reset", "-q")
+                changed_now = self.worktree_changes()
+                gate = iface_gate.gate_worktree(self.wt, self.t["base_branch"])
             self.state.iface_gate = gate
             verify_failed_any = any(r["exit"] != 0 for r in self.state.verify)
             need_review, why = decide_review(self.t, changed_now, diff, verify_failed_any, gate)
