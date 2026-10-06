@@ -1,6 +1,7 @@
 """_test_judge.py — judge.py 的契約測試（常設，每次 CLI 升版就重跑）。
 
-fixtures/ 裡是 2026-09-07 在本機抓的真實樣本（C4a 的 claude_stream_ok／codex_stdin_ok 是 2026-10-05；來源與指令見 fixtures/README.md）。
+fixtures/ 裡是 2026-09-07 在本機抓的真實樣本（C4a 的 codex_stdin_ok 是 2026-10-05；claude_stream_ok／claude_stream_nosafe 是
+2026-10-06 以 2.1.290 重抓的有／無 --safe-mode 對照；來源與指令見 fixtures/README.md）。
 CLI 一升版、欄位語意一變，這裡就會紅燈；沒有這組測試，編排器會默默把失敗記成成功。
 
 跑法：PYTHONUTF8=1 python _test_judge.py   （exit 0＝全過）

@@ -1336,7 +1336,7 @@ def test_impl_command() -> None:
           L("not json") is None and L("{broken") is None and L(json.dumps({"type": "user"})) is None and L("") is None)
     fx = relay.HERE / "fixtures" / "claude_stream_ok.stdout.txt"
     shown = [s for s in (L(x) for x in fx.read_text(encoding="utf-8").splitlines()) if s]
-    check("_claude_line：真樣本 claude_stream_ok 只印兩行（💬 OK、✓ 完成 in=5919 out=4）", shown == ["💬 OK", "✓ 完成 in=5919 out=4"], str(shown))
+    check("_claude_line：真樣本 claude_stream_ok 只印兩行（💬 OK、✓ 完成 in=7114 out=4）", shown == ["💬 OK", "✓ 完成 in=7114 out=4"], str(shown))
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as dd:
         d = Path(dd)
@@ -1368,8 +1368,8 @@ def test_impl_command() -> None:
                     ok, report, usage = r.implement(1, "上一輪：請修 x")
                 rec = r.state.calls[-1] if r.state.calls else {}
                 check("implement(claude)：判定 ok、報告＝result 文字、CallRecord.cli=claude、model／effort 照任務傳",
-                      ok and report == "OK" and rec.get("cli") == "claude" and (usage or {}).get("input_tokens_total") == 5919
-                      and seen == {"cli": "claude", "model": "sonnet", "effort": "high"} and "✓ 完成 in=5919 out=4" in term.getvalue(),
+                      ok and report == "OK" and rec.get("cli") == "claude" and (usage or {}).get("input_tokens_total") == 7114
+                      and seen == {"cli": "claude", "model": "sonnet", "effort": "high"} and "✓ 完成 in=7114 out=4" in term.getvalue(),
                       f"ok={ok} report={report!r} rec={rec} seen={seen}")
                 want = (r.dir / "impl_r1_prompt.md").read_text(encoding="utf-8").encode("utf-8")
                 got = (d / "got_prompt.bin").read_bytes() if (d / "got_prompt.bin").is_file() else b""
